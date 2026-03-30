@@ -1,0 +1,26 @@
+﻿from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(slots=True)
+class RawDocument:
+    source_id: str
+    title: str
+    text: str
+
+
+def collect_documents(path: Path) -> list[RawDocument]:
+    docs: list[RawDocument] = []
+    for file in sorted(path.glob("*.md")):
+        content = file.read_text(encoding="utf-8", errors="ignore")
+        docs.append(RawDocument(source_id=file.stem, title=file.name, text=content))
+    return docs
+
+
+def clean_text(text: str) -> str:
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()

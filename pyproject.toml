@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finance-agent-rag"
+version = "0.1.0"
+description = "金融智能投顾研报系统（多Agent + RAG + 向量数据库）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "langgraph>=0.2.0",
+  "chromadb>=0.5.0",
+  "pytest>=8.0.0",
+  "python-dotenv>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
