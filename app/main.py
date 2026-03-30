@@ -14,7 +14,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = get_config()
-    ensure_sample_knowledge(config.knowledge_base_dir)
+    ensure_sample_knowledge(config.knowledge_base_dir, config.raw_data_dir)
 
     orchestrator = FinanceResearchOrchestrator(config)
     report = orchestrator.run(args.ticker.upper())

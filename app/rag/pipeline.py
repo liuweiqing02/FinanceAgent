@@ -8,6 +8,7 @@ from app.models.schemas import Evidence
 from app.rag.chunking import chunk_text
 from app.rag.embeddings import HashEmbedding
 from app.rag.ingestion import clean_text, collect_documents
+from app.rag.knowledge_builder import build_knowledge_base, ensure_sample_raw_data
 from app.rag.reranker import SimpleReranker
 from app.rag.retriever import HybridRetriever
 from app.rag.vectorstore.chroma_store import ChromaVectorStore
@@ -74,24 +75,9 @@ class RagPipeline:
         return reranked[:k]
 
 
-def ensure_sample_knowledge(path: Path) -> None:
-    """初始化示例知识库，保证开箱可跑。"""
+def ensure_sample_knowledge(path: Path, raw_dir: Path | None = None) -> None:
+    """兼容旧接口：自动构建可检索知识库，而非写入单句样例。"""
 
-    samples = {
-        "AAPL_fundamental.md": """# AAPL 基本面
-苹果公司在高端消费电子市场维持较高毛利率。服务业务占比提升，提升现金流稳定性。""",
-        "AAPL_technical.md": """# AAPL 技术面
-近期价格处于中期上升通道，成交量温和放大。若跌破关键均线，需关注回撤风险。""",
-        "AAPL_news.md": """# AAPL 新闻
-近期供应链传出新机备货增加，市场预期下半年销量改善。""",
-        "TSLA_fundamental.md": """# TSLA 基本面
-特斯拉汽车业务利润率受价格策略影响波动，储能业务增速较快。""",
-        "TSLA_news.md": """# TSLA 新闻
-市场关注自动驾驶监管进展与产能爬坡效率。""",
-    }
-
-    path.mkdir(parents=True, exist_ok=True)
-    for name, content in samples.items():
-        p = path / name
-        if not p.exists():
-            p.write_text(content, encoding="utf-8")
+    use_raw_dir = raw_dir or path.parent / "raw"
+    ensure_sample_raw_data(use_raw_dir)
+    build_knowledge_base(use_raw_dir, path)

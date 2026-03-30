@@ -21,6 +21,7 @@ class AppConfig:
     app_env: str = os.getenv("APP_ENV", "dev")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     report_output_dir: Path = Path(os.getenv("REPORT_OUTPUT_DIR", "reports_output"))
+    raw_data_dir: Path = Path(os.getenv("RAW_DATA_DIR", "data/raw"))
     knowledge_base_dir: Path = Path(os.getenv("KNOWLEDGE_BASE_DIR", "data/knowledge_base"))
     vector_store_provider: str = os.getenv("VECTOR_STORE_PROVIDER", "chroma")
     vector_collection: str = os.getenv("VECTOR_COLLECTION", "finance_docs")
@@ -37,6 +38,7 @@ def get_config() -> AppConfig:
 
     config = AppConfig()
     config.report_output_dir.mkdir(parents=True, exist_ok=True)
+    config.raw_data_dir.mkdir(parents=True, exist_ok=True)
     config.knowledge_base_dir.mkdir(parents=True, exist_ok=True)
     config.chroma_persist_dir.mkdir(parents=True, exist_ok=True)
     return config
