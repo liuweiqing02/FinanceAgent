@@ -97,6 +97,39 @@ def _extract_json_block(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_from_plain_text(text: str, fallback_ref: int) -> tuple[str, list[str]] | None:
+    s = text.strip()
+    if not s:
+        return None
+
+    lines = [x.strip() for x in s.splitlines() if x.strip()]
+    cands = [x for x in lines if (x.startswith("-") or x.startswith("1.") or x.startswith("2.") or x.startswith("3.")) and "[E" in x]
+    if len(cands) >= 3:
+        conc = [_ensure_cited(re.sub(r"^[-*\d.\s]+", "", x).strip(), fallback_ref) for x in cands[:4]]
+        return s, conc
+
+    m = re.search(r"结论[：:]?([\s\S]{0,1200})", s)
+    if m:
+        tail = [x.strip(" -") for x in m.group(1).splitlines() if x.strip()]
+        conc2 = [_ensure_cited(x, fallback_ref) for x in tail[:4] if len(x) > 6]
+        if len(conc2) >= 3:
+            return s, conc2
+    return None
+
+
+def _validate_payload(obj: dict[str, Any], min_conclusions: int = 3) -> tuple[bool, str, list[str]]:
+    analysis = str(obj.get("analysis", "")).strip()
+    raw = obj.get("conclusions", [])
+    if not isinstance(raw, list):
+        return False, "conclusions 不是数组", []
+    conc = [str(x).strip() for x in raw if str(x).strip()]
+    if len(conc) < min_conclusions:
+        return False, f"conclusions 数量不足: {len(conc)}", conc
+    if len(analysis) < 80:
+        return False, f"analysis 太短: {len(analysis)}", conc
+    return True, "", conc
+
+
 def _llm_rewrite(
     *,
     llm: Any | None,
@@ -106,56 +139,78 @@ def _llm_rewrite(
     analysis: str,
     conclusions: list[str],
     refs: list[tuple[int, Evidence]],
+    retry_max: int = 2,
 ) -> tuple[str, list[str]]:
     if llm is None:
         return analysis, conclusions
 
+    fallback_ref = refs[0][0] if refs else 1
     evidence_text = "\n".join(
         f"[E{ref}] {ev.title} | {ev.content[:500].replace(chr(10), ' ')}" for ref, ev in refs[:3]
     )
     system_prompt = "你是资深股票分析师，请输出可审计、可落地、结论有证据编号的中文分析。"
-    user_prompt = (
-        f"请重写 {ticker} 的{agent_name}分析，主题={topic}。\n"
-        "必须满足：\n"
-        "1) analysis 至少 220 字，不能空话，必须出现具体数据字段与因果解释。\n"
-        "2) conclusions 输出 3~4 条，每条必须包含 [E数字] 引用。\n"
-        "3) 如果证据不足，明确写出不足项，但不要编造数据。\n"
-        "4) 返回 JSON：{\"analysis\":\"...\",\"conclusions\":[\"...\"]}。\n"
-        f"可用证据:\n{evidence_text}\n\n"
-        f"当前草稿analysis:\n{analysis}\n\n"
-        f"当前草稿conclusions:\n{json.dumps(conclusions, ensure_ascii=False)}"
-    )
 
-    try:
-        text = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
-        obj = _extract_json_block(text)
-        if not obj:
-            return analysis, conclusions
-        new_analysis = str(obj.get("analysis", "")).strip()
-        new_conclusions = obj.get("conclusions", [])
-        if not isinstance(new_conclusions, list):
-            return analysis, conclusions
+    last_output = ""
+    last_error = ""
+    attempts = max(1, retry_max + 1)
 
-        clean_conclusions: list[str] = []
-        fallback_ref = refs[0][0] if refs else 1
-        for c in new_conclusions:
-            s = _ensure_cited(str(c).strip(), fallback_ref)
-            if s:
-                clean_conclusions.append(s)
-        if len(clean_conclusions) < 3:
-            return analysis, conclusions
-        if len(new_analysis) < 80:
-            return analysis, conclusions
-        return new_analysis, clean_conclusions[:4]
-    except Exception:  # noqa: BLE001
-        return analysis, conclusions
+    for i in range(attempts):
+        fix_hint = ""
+        if i > 0:
+            fix_hint = (
+                "\n上一次输出校验失败，请修复后严格只输出 JSON。"
+                f"\n失败原因：{last_error}"
+                f"\n上次输出：{last_output[:1200]}"
+            )
+
+        user_prompt = (
+            f"请重写 {ticker} 的{agent_name}分析，主题={topic}。\n"
+            "必须满足：\n"
+            "1) analysis 至少 220 字，不能空话，必须出现具体数据字段与因果解释。\n"
+            "2) conclusions 输出 3~4 条，每条必须包含 [E数字] 引用。\n"
+            "3) 如果证据不足，明确写出不足项，但不要编造数据。\n"
+            "4) 只返回 JSON：{\"analysis\":\"...\",\"conclusions\":[\"...\"]}，不要解释。\n"
+            f"可用证据:\n{evidence_text}\n\n"
+            f"当前草稿analysis:\n{analysis}\n\n"
+            f"当前草稿conclusions:\n{json.dumps(conclusions, ensure_ascii=False)}"
+            f"{fix_hint}"
+        )
+
+        try:
+            text = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            last_output = text
+            obj = _extract_json_block(text)
+            if not obj:
+                last_error = "未解析到 JSON 对象"
+                continue
+
+            ok, reason, conc = _validate_payload(obj)
+            if not ok:
+                last_error = reason
+                continue
+
+            clean_conclusions = [_ensure_cited(x, fallback_ref) for x in conc[:4]]
+            return str(obj.get("analysis", "")).strip(), clean_conclusions
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"调用异常: {exc}"
+
+    # JSON 重试全部失败后，尝试文本抽取。
+    if last_output:
+        parsed = _extract_from_plain_text(last_output, fallback_ref)
+        if parsed is not None:
+            p_analysis, p_conc = parsed
+            p_analysis = p_analysis + "\n\n注：本段由 LLM 文本抽取生成（JSON 校验失败后降级）。"
+            return p_analysis, p_conc
+
+    return analysis, conclusions
 
 
 class FundamentalAgent(BaseAgent):
     name = "基本面"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, retry_max: int = 2) -> None:
         self.llm = llm
+        self.retry_max = retry_max
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "fundamental", limit=3)
@@ -207,6 +262,7 @@ class FundamentalAgent(BaseAgent):
             analysis=analysis,
             conclusions=conclusions,
             refs=refs,
+            retry_max=self.retry_max,
         )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -214,8 +270,9 @@ class FundamentalAgent(BaseAgent):
 class TechnicalAgent(BaseAgent):
     name = "技术面"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, retry_max: int = 2) -> None:
         self.llm = llm
+        self.retry_max = retry_max
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "technical", limit=3)
@@ -264,6 +321,7 @@ class TechnicalAgent(BaseAgent):
             analysis=analysis,
             conclusions=conclusions,
             refs=refs,
+            retry_max=self.retry_max,
         )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -271,8 +329,9 @@ class TechnicalAgent(BaseAgent):
 class ValuationAgent(BaseAgent):
     name = "估值"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, retry_max: int = 2) -> None:
         self.llm = llm
+        self.retry_max = retry_max
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "valuation", limit=3)
@@ -321,6 +380,7 @@ class ValuationAgent(BaseAgent):
             analysis=analysis,
             conclusions=conclusions,
             refs=refs,
+            retry_max=self.retry_max,
         )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -328,8 +388,9 @@ class ValuationAgent(BaseAgent):
 class NewsAgent(BaseAgent):
     name = "新闻"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, retry_max: int = 2) -> None:
         self.llm = llm
+        self.retry_max = retry_max
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "news", limit=3)
@@ -388,5 +449,6 @@ class NewsAgent(BaseAgent):
             analysis=analysis,
             conclusions=conclusions,
             refs=refs,
+            retry_max=self.retry_max,
         )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)

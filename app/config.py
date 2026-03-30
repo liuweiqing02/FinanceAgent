@@ -45,6 +45,7 @@ class AppConfig:
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
     llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "1400"))
+    llm_json_retry_max: int = int(os.getenv("LLM_JSON_RETRY_MAX", "2"))
 
 
 def get_config() -> AppConfig:

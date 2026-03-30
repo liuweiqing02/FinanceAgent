@@ -11,8 +11,9 @@ from app.models.sentiment_risk import infer_sentiment_and_risk
 class SummaryAgent:
     name = "总结"
 
-    def __init__(self, llm: Any | None = None) -> None:
+    def __init__(self, llm: Any | None = None, retry_max: int = 2) -> None:
         self.llm = llm
+        self.retry_max = retry_max
 
     def run(self, ticker: str, outputs: list[AgentOutput], evidence: list[Evidence]) -> AgentOutput:
         merged_text = "\n".join(o.analysis for o in outputs)
@@ -42,7 +43,7 @@ class SummaryAgent:
             _ensure_citation(f"若出现技术位破坏或负面新闻扩散，应快速降低敞口 {cite.get(4, '[E4]')}", 4),
         ]
 
-        analysis, conclusions = _llm_rewrite_summary(self.llm, ticker, outputs, evidence, analysis, conclusions)
+        analysis, conclusions = _llm_rewrite_summary(self.llm, ticker, outputs, evidence, analysis, conclusions, self.retry_max)
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
 
@@ -79,6 +80,18 @@ def _extract_json_block(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_from_plain_text(text: str, fallback_ref: int) -> tuple[str, list[str]] | None:
+    s = text.strip()
+    if not s:
+        return None
+    lines = [x.strip() for x in s.splitlines() if x.strip()]
+    cands = [x for x in lines if (x.startswith("-") or x.startswith("1.") or x.startswith("2.") or x.startswith("3.") or x.startswith("4.")) and "[E" in x]
+    if len(cands) >= 4:
+        conc = [_ensure_citation(re.sub(r"^[-*\d.\s]+", "", x).strip(), fallback_ref) for x in cands[:4]]
+        return s, conc
+    return None
+
+
 def _llm_rewrite_summary(
     llm: Any | None,
     ticker: str,
@@ -86,6 +99,7 @@ def _llm_rewrite_summary(
     evidence: list[Evidence],
     analysis: str,
     conclusions: list[str],
+    retry_max: int,
 ) -> tuple[str, list[str]]:
     if llm is None:
         return analysis, conclusions
@@ -93,28 +107,59 @@ def _llm_rewrite_summary(
     block = "\n\n".join(f"## {o.name}\n{o.analysis}\n\n结论: {o.conclusions}" for o in outputs)
     ev = "\n".join(f"[E{i}] {x.title}: {x.content[:300].replace(chr(10), ' ')}" for i, x in enumerate(evidence[:5], start=1))
 
-    user_prompt = (
-        f"请基于四个并行专家输出，重写 {ticker} 的综合结论。\n"
-        "要求：\n"
-        "1) 输出 JSON：{\"analysis\":\"...\",\"conclusions\":[\"...\"]}。\n"
-        "2) analysis 至少 260 字，必须覆盖一致点、分歧点、主要风险、执行建议。\n"
-        "3) conclusions 给 4 条，每条必须有 [E数字]。\n"
-        "4) 不得编造证据，不足就明确写证据不足。\n"
-        f"专家输出:\n{block}\n\n证据:\n{ev}\n\n当前草稿:\n{analysis}\n{json.dumps(conclusions, ensure_ascii=False)}"
-    )
+    last_output = ""
+    last_error = ""
+    attempts = max(1, retry_max + 1)
 
-    try:
-        text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性。", user_prompt=user_prompt)
-        obj = _extract_json_block(text)
-        if not obj:
-            return analysis, conclusions
-        new_analysis = str(obj.get("analysis", "")).strip()
-        raw_c = obj.get("conclusions", [])
-        if not isinstance(raw_c, list):
-            return analysis, conclusions
-        out = [_ensure_citation(str(x).strip(), i + 1) for i, x in enumerate(raw_c[:4]) if str(x).strip()]
-        if len(out) < 4 or len(new_analysis) < 100:
-            return analysis, conclusions
-        return new_analysis, out
-    except Exception:  # noqa: BLE001
-        return analysis, conclusions
+    for i in range(attempts):
+        fix_hint = ""
+        if i > 0:
+            fix_hint = (
+                "\n上一次输出校验失败，请修复后严格只输出 JSON。"
+                f"\n失败原因：{last_error}"
+                f"\n上次输出：{last_output[:1200]}"
+            )
+
+        user_prompt = (
+            f"请基于四个并行专家输出，重写 {ticker} 的综合结论。\n"
+            "要求：\n"
+            "1) 输出 JSON：{\"analysis\":\"...\",\"conclusions\":[\"...\"]}。\n"
+            "2) analysis 至少 260 字，必须覆盖一致点、分歧点、主要风险、执行建议。\n"
+            "3) conclusions 给 4 条，每条必须有 [E数字]。\n"
+            "4) 不得编造证据，不足就明确写证据不足。\n"
+            f"专家输出:\n{block}\n\n证据:\n{ev}\n\n当前草稿:\n{analysis}\n{json.dumps(conclusions, ensure_ascii=False)}"
+            f"{fix_hint}"
+        )
+
+        try:
+            text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性。", user_prompt=user_prompt)
+            last_output = text
+            obj = _extract_json_block(text)
+            if not obj:
+                last_error = "未解析到 JSON"
+                continue
+
+            new_analysis = str(obj.get("analysis", "")).strip()
+            raw_c = obj.get("conclusions", [])
+            if not isinstance(raw_c, list):
+                last_error = "conclusions 不是数组"
+                continue
+            out = [_ensure_citation(str(x).strip(), i + 1) for i, x in enumerate(raw_c[:4]) if str(x).strip()]
+            if len(out) < 4:
+                last_error = f"conclusions 数量不足: {len(out)}"
+                continue
+            if len(new_analysis) < 100:
+                last_error = f"analysis 太短: {len(new_analysis)}"
+                continue
+            return new_analysis, out
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"调用异常: {exc}"
+
+    if last_output:
+        parsed = _extract_from_plain_text(last_output, 1)
+        if parsed is not None:
+            p_analysis, p_conc = parsed
+            p_analysis = p_analysis + "\n\n注：本段由 LLM 文本抽取生成（JSON 校验失败后降级）。"
+            return p_analysis, p_conc
+
+    return analysis, conclusions
