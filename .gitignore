@@ -1,0 +1,14 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime
+reports_output/
+logs/
+.chroma/
+.env
