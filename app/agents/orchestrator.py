@@ -49,7 +49,7 @@ class FinanceResearchOrchestrator:
 
         outputs = self._run_agents(ticker, evidence)
         summary = self.summary.run(ticker, outputs, evidence)
-        bundle = build_markdown_report(ticker, outputs, summary, evidence)
+        bundle = build_markdown_report(ticker, outputs, summary, evidence, market_snapshot=market.data if market.ok else None)
 
         self.logger.log(
             "generation",
