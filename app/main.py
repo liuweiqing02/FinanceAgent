@@ -9,6 +9,13 @@ from app.rag.knowledge_builder import build_knowledge_base, ensure_sample_raw_da
 from app.rag.real_collectors import collect_real_raw_data
 
 
+def _has_real_raw(raw_dir: Path) -> bool:
+    for p in raw_dir.glob("real_*.jsonl"):
+        if p.exists() and p.stat().st_size > 0:
+            return True
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="金融智能投顾研报系统")
     parser.add_argument("--ticker", default="AAPL", help="股票代码")
@@ -37,8 +44,13 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             if args.kb_mode == "real":
                 raise
-            print(f"真实采集失败，自动降级样例模式。原因: {exc}")
-            mode = "sample"
+            if _has_real_raw(config.raw_data_dir):
+                print(f"真实采集失败，改为复用已有真实数据。原因: {exc}")
+                mode = "real"
+                include_glob = "real_*.jsonl"
+            else:
+                print(f"真实采集失败，自动降级样例模式。原因: {exc}")
+                mode = "sample"
 
     if mode == "sample":
         ensure_sample_raw_data(config.raw_data_dir)

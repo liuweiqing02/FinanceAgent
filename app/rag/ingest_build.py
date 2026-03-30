@@ -8,6 +8,13 @@ from app.rag.knowledge_builder import build_knowledge_base, ensure_sample_raw_da
 from app.rag.real_collectors import collect_real_raw_data
 
 
+def _has_real_raw(raw_dir: Path) -> bool:
+    for p in raw_dir.glob("real_*.jsonl"):
+        if p.exists() and p.stat().st_size > 0:
+            return True
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="构建金融知识库（原始数据 -> Markdown知识库）")
     parser.add_argument("--raw-dir", default=None, help="原始数据目录，默认读取配置 RAW_DATA_DIR")
@@ -50,8 +57,13 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             if args.mode == "real":
                 raise
-            print(f"真实采集失败，自动降级样例模式。原因: {exc}")
-            used_mode = "sample"
+            if _has_real_raw(raw_dir):
+                print(f"真实采集失败，改为复用已有真实数据。原因: {exc}")
+                used_mode = "real"
+                include_glob = "real_*.jsonl"
+            else:
+                print(f"真实采集失败，自动降级样例模式。原因: {exc}")
+                used_mode = "sample"
 
     if used_mode == "sample":
         ensure_sample_raw_data(raw_dir)
