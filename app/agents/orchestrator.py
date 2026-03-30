@@ -8,7 +8,7 @@ from app.agents.specialists import FundamentalAgent, NewsAgent, TechnicalAgent, 
 from app.agents.summary_agent import SummaryAgent
 from app.config import AppConfig
 from app.infra.logger import JsonlLogger
-from app.mcp.protocol import LocalMCPServer, MultiServerMCPClient, ToolRequest
+from app.mcp.protocol import FASTMCP_AVAILABLE, FastMCPServerAdapter, LocalMCPServer, MultiServerMCPClient, ToolRequest
 from app.mcp.tools import get_fundamental_snapshot, get_market_snapshot, load_news_file
 from app.models.schemas import AgentOutput, Evidence, ReportBundle
 from app.rag.pipeline import RagPipeline
@@ -32,7 +32,9 @@ class FinanceResearchOrchestrator:
         self.rag = RagPipeline(config, self.logger)
 
         self.mcp = MultiServerMCPClient()
-        finance_server = LocalMCPServer("finance_data")
+
+        server_cls = FastMCPServerAdapter if FASTMCP_AVAILABLE else LocalMCPServer
+        finance_server = server_cls("finance_data")
         finance_server.register_tool(
             name="market_snapshot",
             fn=get_market_snapshot,
@@ -46,7 +48,7 @@ class FinanceResearchOrchestrator:
             input_schema={"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]},
         )
 
-        kb_server = LocalMCPServer("knowledge_base")
+        kb_server = server_cls("knowledge_base")
         kb_server.register_tool(
             name="load_news_file",
             fn=load_news_file,
@@ -72,7 +74,7 @@ class FinanceResearchOrchestrator:
         evidence = self.rag.retrieve(query, top_k=self.config.top_k)
 
         tools = [f"{t.server}.{t.name}" for t in self.mcp.list_tools()]
-        self.logger.log("mcp_tools", {"count": len(tools), "tools": tools})
+        self.logger.log("mcp_tools", {"count": len(tools), "tools": tools, "backend": "fastmcp" if FASTMCP_AVAILABLE else "local"})
 
         market = self.mcp.call_tool(ToolRequest(server="finance_data", tool_name="market_snapshot", args={"ticker": ticker}))
         fundamental = self.mcp.call_tool(ToolRequest(server="finance_data", tool_name="fundamental_snapshot", args={"ticker": ticker}))

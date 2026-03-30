@@ -1,4 +1,10 @@
-﻿from app.mcp.protocol import LocalMCPServer, MultiServerMCPClient, ToolRequest
+﻿from app.mcp.protocol import (
+    FASTMCP_AVAILABLE,
+    FastMCPServerAdapter,
+    LocalMCPServer,
+    MultiServerMCPClient,
+    ToolRequest,
+)
 
 
 def test_multiserver_list_and_call() -> None:
@@ -7,7 +13,7 @@ def test_multiserver_list_and_call() -> None:
     s2 = LocalMCPServer("kb")
 
     s1.register_tool("echo", lambda msg: {"msg": msg}, description="echo msg")
-    s2.register_tool("len", lambda text: {"n": len(text)}, description="len text")
+    s2.register_tool("strlen", lambda text: {"n": len(text)}, description="len text")
 
     c.register_server(s1)
     c.register_server(s2)
@@ -15,7 +21,7 @@ def test_multiserver_list_and_call() -> None:
     tools = c.list_tools()
     names = {f"{t.server}.{t.name}" for t in tools}
     assert "finance.echo" in names
-    assert "kb.len" in names
+    assert "kb.strlen" in names
 
     r = c.call_tool(ToolRequest(server="finance", tool_name="echo", args={"msg": "ok"}))
     assert r.ok is True
@@ -43,3 +49,18 @@ def test_multiserver_unknown_server() -> None:
     r = c.call_tool(ToolRequest(server="missing", tool_name="x"))
     assert r.ok is False
     assert "unknown server" in (r.error or "")
+
+
+def test_fastmcp_adapter_if_available() -> None:
+    if not FASTMCP_AVAILABLE:
+        return
+
+    server = FastMCPServerAdapter("finance_fast")
+    server.register_tool("add", lambda a, b: a + b, description="add numbers")
+
+    tools = server.list_tools()
+    assert any(t.name == "add" for t in tools)
+
+    r = server.call_tool("add", {"a": 1, "b": 2})
+    assert r.ok is True
+    assert r.data == 3
