@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import re
+
 from app.agents.base import BaseAgent
 from app.models.schemas import AgentOutput, Evidence
 from app.models.sentiment_risk import infer_news_sentiment_and_risk_5level
@@ -9,70 +11,114 @@ def _citation(index: int) -> str:
     return f"[E{index}]"
 
 
-def _safe_evidence(evidence: list[Evidence], idx: int) -> Evidence | None:
-    if 0 <= idx < len(evidence):
-        return evidence[idx]
-    return None
-
-
-def _evidence_line(evidence: list[Evidence], idx: int) -> str:
-    ev = _safe_evidence(evidence, idx)
-    if ev is None:
-        return f"- {_citation(1)} 暂无可用证据，建议补充最新财报和公告。"
-    return f"- {_citation(idx + 1)} {ev.title}（score={ev.score}）：{ev.content[:110].replace(chr(10), ' ')}"
-
-
 def _ensure_cited(text: str, default_idx: int = 1) -> str:
     if "[E" in text:
         return text
     return f"{text} {_citation(default_idx)}"
 
 
-def _evidence_ref(evidence: list[Evidence], target: Evidence) -> int:
-    for i, ev in enumerate(evidence, start=1):
-        if ev is target:
-            return i
-    for i, ev in enumerate(evidence, start=1):
-        if ev.source_id == target.source_id and ev.title == target.title:
-            return i
-    return 1
+def _is_readable(text: str) -> bool:
+    if len(text.strip()) < 40:
+        return False
+    long_tokens = re.findall(r"[A-Za-z0-9_-]{35,}", text)
+    if len(long_tokens) >= 2:
+        return False
+    latin = sum(ch.isalpha() for ch in text)
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    readable_ratio = (latin + cjk) / max(len(text), 1)
+    return readable_ratio >= 0.15
 
 
-def _news_like(e: Evidence) -> bool:
-    s = f"{e.title} {e.source_id}".lower()
-    return "news" in s or "8-k" in s or "rss" in s
+def _topic_like(ev: Evidence, topic: str) -> bool:
+    tag = f"{ev.title} {ev.source_id}".lower()
+    if topic == "fundamental":
+        return "fundamental" in tag or "10-k" in tag or "10-q" in tag or "mcp_fundamental" in tag
+    if topic == "technical":
+        return "technical" in tag or "sma" in ev.content.lower() or "mcp_market" in tag
+    if topic == "valuation":
+        return "valuation" in tag or "p/e" in ev.content.lower() or "mcp_market" in tag or "mcp_fundamental" in tag
+    if topic == "news":
+        return "news" in tag or "8-k" in tag or "rss" in tag
+    return False
+
+
+def _select_evidence(evidence: list[Evidence], topic: str, limit: int = 3) -> list[tuple[int, Evidence]]:
+    picked: list[tuple[int, Evidence]] = []
+    for i, ev in enumerate(evidence, start=1):
+        if _topic_like(ev, topic) and _is_readable(ev.content):
+            picked.append((i, ev))
+            if len(picked) >= limit:
+                return picked
+    for i, ev in enumerate(evidence, start=1):
+        if _is_readable(ev.content) and (i, ev) not in picked:
+            picked.append((i, ev))
+            if len(picked) >= limit:
+                break
+    return picked
+
+
+def _kv_from_text(text: str, keys: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k in keys:
+        m = re.search(rf"{re.escape(k)}\s*[=:]\s*([^，。;\n]+)", text, flags=re.IGNORECASE)
+        if m:
+            v = m.group(1).strip()
+            if v and v.upper() not in {"N/A", "NA", "NONE", "NULL"}:
+                out[k] = v
+    return out
+
+
+def _evidence_line(ref: int, ev: Evidence, max_len: int = 140) -> str:
+    clean = " ".join(ev.content.replace("\n", " ").split())
+    if len(clean) > max_len:
+        clean = clean[:max_len] + "..."
+    return f"- [E{ref}] {ev.title}（score={ev.score}）：{clean}"
 
 
 class FundamentalAgent(BaseAgent):
     name = "基本面"
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
+        refs = _select_evidence(evidence, "fundamental", limit=3)
+        first_ref = refs[0][0] if refs else 1
+
+        metrics: list[str] = []
+        for ref, ev in refs:
+            kv = _kv_from_text(
+                ev.content,
+                ["营收增速", "利润增速", "毛利率", "营业利润率", "净利率", "ROE", "自由现金流", "总现金"],
+            )
+            if kv:
+                metrics.append(f"- [E{ref}] " + "，".join(f"{k}={v}" for k, v in kv.items()))
+
+        if not metrics:
+            metrics.append("- 当前召回文本未提取到结构化财务指标，建议补充最新 10-Q/10-K 原文段落。")
+
         analysis = "\n".join(
             [
-                f"{ticker} 基本面从盈利质量、现金流稳定性与业务结构三条主线展开。",
+                f"{ticker} 基本面围绕盈利质量、现金流与增长兑现进行量化判断。",
                 "",
                 "框架判断：",
-                "- 盈利质量：关注毛利率与净利率变化，判断业绩增长是否可持续。",
-                "- 经营韧性：关注现金流与资本开支匹配，识别扩张期资金压力。",
-                "- 成长兑现：关注核心业务增速与新业务贡献，判断估值支撑强度。",
+                "- 盈利质量：优先看毛利率、营业利润率、净利率是否同步改善。",
+                "- 现金流韧性：看自由现金流与总现金能否覆盖回购/资本开支。",
+                "- 成长兑现：看营收增速与利润增速是否同向。",
+                "",
+                "关键数据：",
+                *metrics,
                 "",
                 "证据解读：",
-                _evidence_line(evidence, 0),
-                _evidence_line(evidence, 1),
+                *[_evidence_line(ref, ev) for ref, ev in refs[:2]],
                 "",
                 "风险提示：",
-                "- 若盈利改善主要依赖一次性因素，后续可能出现回落。",
-                "- 若需求端不及预期，估值扩张空间可能受限。",
-                "",
-                "跟踪建议：",
-                "- 下次财报重点跟踪利润率、经营现金流和分业务收入结构。",
+                "- 若利润增速显著低于营收增速，可能意味着成本端压力上升。",
+                "- 若自由现金流走弱且资本开支持续抬升，需关注资金安全边际。",
             ]
         )
 
         conclusions = [
-            _ensure_cited(f"{ticker} 基本面当前偏稳健，具备中期跟踪价值 {_citation(1)}", 1),
-            _ensure_cited(f"若后续盈利质量持续改善，估值中枢有上修可能 {_citation(2)}", 2),
-            _ensure_cited("需警惕需求波动对利润兑现节奏的扰动 [E1]", 1),
+            _ensure_cited(f"{ticker} 基本面结论应以财务指标实测值为锚，而非仅凭叙述判断 [E{first_ref}]", first_ref),
+            _ensure_cited(f"若营收与利润增速同步改善，估值中枢存在上修基础 [E{first_ref}]", first_ref),
+            _ensure_cited(f"若现金流覆盖能力下降，需要下调仓位容忍区间 [E{first_ref}]", first_ref),
         ]
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -81,32 +127,43 @@ class TechnicalAgent(BaseAgent):
     name = "技术面"
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
+        refs = _select_evidence(evidence, "technical", limit=3)
+        first_ref = refs[0][0] if refs else 1
+
+        metric_lines: list[str] = []
+        for ref, ev in refs:
+            kv = _kv_from_text(ev.content, ["最新价", "SMA20", "SMA60", "5日均量", "20日均量", "日内涨跌幅"])
+            if kv:
+                metric_lines.append(f"- [E{ref}] " + "，".join(f"{k}={v}" for k, v in kv.items()))
+
+        if not metric_lines:
+            metric_lines.append("- 当前召回文本缺少可计算的均线/量能字段，建议补充行情快照。")
+
         analysis = "\n".join(
             [
-                f"{ticker} 技术面围绕趋势、动量与关键支撑阻力位进行判断。",
+                f"{ticker} 技术面聚焦趋势方向、量价配合和风险位管理。",
                 "",
                 "框架判断：",
-                "- 趋势方向：观察中期均线斜率与价格位置。",
-                "- 交易热度：观察成交量变化与价格共振情况。",
-                "- 风险位置：识别关键支撑位与止损触发区域。",
+                "- 趋势：看价格与 SMA20/SMA60 相对位置。",
+                "- 量能：看 5 日均量相对 20 日均量是否放大。",
+                "- 波动：看日内涨跌幅是否超出常态区间。",
+                "",
+                "关键数据：",
+                *metric_lines,
                 "",
                 "证据解读：",
-                _evidence_line(evidence, 1),
-                _evidence_line(evidence, 2),
+                *[_evidence_line(ref, ev) for ref, ev in refs[:2]],
                 "",
                 "风险提示：",
-                "- 放量滞涨通常意味着短线分歧加大。",
-                "- 跌破关键均线后，回撤幅度可能扩大。",
-                "",
-                "交易建议：",
-                "- 采用分批建仓与分层止损，避免单点决策。",
+                "- 放量下跌通常比缩量下跌更需要快速降风险。",
+                "- 当价格反复跌破中期均线，趋势策略胜率会明显下降。",
             ]
         )
 
         conclusions = [
-            _ensure_cited(f"{ticker} 当前更适合趋势跟随而非逆势抄底 {_citation(2)}", 2),
-            _ensure_cited(f"若跌破关键支撑位，应优先执行风控纪律 {_citation(3)}", 3),
-            _ensure_cited("短期波动或加大，仓位管理优先级高于收益博弈 [E2]", 2),
+            _ensure_cited(f"{ticker} 技术面应优先依据均线和量能数据执行，而非主观预测 [E{first_ref}]", first_ref),
+            _ensure_cited(f"若量价出现背离，需要缩短持仓评估周期 [E{first_ref}]", first_ref),
+            _ensure_cited(f"跌破关键支撑位时应先执行风控再讨论反弹 [E{first_ref}]", first_ref),
         ]
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -115,32 +172,43 @@ class ValuationAgent(BaseAgent):
     name = "估值"
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
+        refs = _select_evidence(evidence, "valuation", limit=3)
+        first_ref = refs[0][0] if refs else 1
+
+        metrics: list[str] = []
+        for ref, ev in refs:
+            kv = _kv_from_text(ev.content, ["PE", "Forward PE", "P/B", "Trailing PE", "price_to_book", "营收增速", "利润增速"])
+            if kv:
+                metrics.append(f"- [E{ref}] " + "，".join(f"{k}={v}" for k, v in kv.items()))
+
+        if not metrics:
+            metrics.append("- 当前召回文本缺少估值倍数字段，建议补充 market/fundamental MCP 快照。")
+
         analysis = "\n".join(
             [
-                f"{ticker} 估值分析采用“增长-估值匹配度”与“安全边际”双维度评估。",
+                f"{ticker} 估值分析采用“倍数水平 + 增长匹配 + 安全边际”三步法。",
                 "",
                 "框架判断：",
-                "- 相对估值：结合行业可比公司估值区间进行横向比较。",
-                "- 绝对估值：结合未来现金流与增长预期进行纵向验证。",
-                "- 安全边际：评估当前价格对悲观场景的容忍度。",
+                "- 倍数水平：PE/PB 在历史区间中的位置。",
+                "- 增长匹配：估值扩张是否有营收/利润增速支撑。",
+                "- 安全边际：悲观情景下估值压缩的容忍度。",
+                "",
+                "关键数据：",
+                *metrics,
                 "",
                 "证据解读：",
-                _evidence_line(evidence, 0),
-                _evidence_line(evidence, 3),
+                *[_evidence_line(ref, ev) for ref, ev in refs[:2]],
                 "",
                 "风险提示：",
-                "- 若增长预期下修，估值溢价会快速收敛。",
-                "- 若利率中枢上行，高估值资产承压更明显。",
-                "",
-                "策略建议：",
-                "- 在估值扩张阶段控制追高节奏，在回调阶段关注性价比。",
+                "- 高估值在增速放缓阶段容易触发双杀。",
+                "- 利率中枢抬升时，高久期资产估值更脆弱。",
             ]
         )
 
         conclusions = [
-            _ensure_cited(f"{ticker} 估值需要与盈利兑现同步验证，不能仅看静态倍数 {_citation(1)}", 1),
-            _ensure_cited(f"若增长保持韧性，当前估值仍有一定容纳空间 {_citation(4)}", 4),
-            _ensure_cited("建议以安全边际为核心设定买入与加仓阈值 [E1]", 1),
+            _ensure_cited(f"{ticker} 估值结论必须与增长兑现数据绑定，不能只看静态 PE/PB [E{first_ref}]", first_ref),
+            _ensure_cited(f"若增长与利润率同步改善，估值溢价才更可持续 [E{first_ref}]", first_ref),
+            _ensure_cited(f"建议按安全边际设定分批买入和减仓阈值 [E{first_ref}]", first_ref),
         ]
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
@@ -149,16 +217,15 @@ class NewsAgent(BaseAgent):
     name = "新闻"
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
-        news_evs = [ev for ev in evidence if _news_like(ev)]
-        if not news_evs:
-            news_evs = evidence[:2]
+        refs = _select_evidence(evidence, "news", limit=3)
+        if not refs:
+            refs = _select_evidence(evidence, "fundamental", limit=2)
 
         scored_rows: list[str] = []
-        sent_lv = []
-        risk_lv = []
-        for ev in news_evs[:3]:
+        sent_lv: list[int] = []
+        risk_lv: list[int] = []
+        for ref, ev in refs[:3]:
             r = infer_news_sentiment_and_risk_5level(ev.content)
-            ref = _evidence_ref(evidence, ev)
             sent_lv.append(r.sentiment_level)
             risk_lv.append(r.risk_level)
             scored_rows.append(
@@ -167,15 +234,17 @@ class NewsAgent(BaseAgent):
 
         avg_sent = round(sum(sent_lv) / max(len(sent_lv), 1), 2)
         avg_risk = round(sum(risk_lv) / max(len(risk_lv), 1), 2)
+        first_ref = refs[0][0] if refs else 1
+        second_ref = refs[1][0] if len(refs) > 1 else first_ref
 
         analysis = "\n".join(
             [
-                f"{ticker} 新闻面分析关注事件冲击、预期差与情绪扩散路径。",
+                f"{ticker} 新闻面分析聚焦事件强度、预期变化与情绪扩散。",
                 "",
                 "框架判断：",
-                "- 事件强度：识别政策、供应链、产品周期等高影响事件。",
-                "- 预期变化：判断新闻是否改变市场对利润和增长的预期。",
-                "- 持续性：区分一次性噪音与中期趋势信号。",
+                "- 事件强度：识别监管、产品、供应链等高冲击事件。",
+                "- 预期变化：判断新闻是否改变盈利/估值假设。",
+                "- 持续性：区分一次性噪音与可持续催化。",
                 "",
                 "情感/风险模型（1~5级）：",
                 f"- 平均情感等级：{avg_sent}（1=极负面，5=极正面）",
@@ -183,22 +252,17 @@ class NewsAgent(BaseAgent):
                 *scored_rows,
                 "",
                 "证据解读：",
-                *[_evidence_line(evidence, _evidence_ref(evidence, ev)-1) for ev in news_evs[:2]],
+                *[_evidence_line(ref, ev) for ref, ev in refs[:2]],
                 "",
                 "风险提示：",
-                "- 新闻驱动行情通常波动更快，回撤也更陡。",
-                "- 单一消息源可能带来偏差，需交叉验证。",
-                "",
-                "跟踪建议：",
-                "- 建议建立“事件-预期-价格”联动表，每日滚动复核。",
+                "- 新闻驱动阶段应提升复盘频次，避免单条消息放大偏见。",
+                "- 若负面新闻与技术破位共振，优先处理风险敞口。",
             ]
         )
 
-        ref1 = _evidence_ref(evidence, news_evs[0]) if news_evs else 1
-        ref2 = _evidence_ref(evidence, news_evs[1]) if len(news_evs) > 1 else ref1
         conclusions = [
-            _ensure_cited(f"{ticker} 新闻情感等级均值为{avg_sent}，短期情绪影响不可忽视 [E{ref1}]", ref1),
-            _ensure_cited(f"{ticker} 新闻风险等级均值为{avg_risk}，建议保持动态风控 [E{ref2}]", ref2),
-            _ensure_cited(f"建议避免基于单条新闻进行重仓决策 [E{ref1}]", ref1),
+            _ensure_cited(f"{ticker} 新闻情感均值={avg_sent}，短期交易情绪影响显著 [E{first_ref}]", first_ref),
+            _ensure_cited(f"{ticker} 新闻风险均值={avg_risk}，建议执行事件驱动风控 [E{second_ref}]", second_ref),
+            _ensure_cited(f"重大仓位决策应至少基于两条独立新闻证据交叉验证 [E{first_ref}]", first_ref),
         ]
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)

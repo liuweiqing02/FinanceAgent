@@ -9,7 +9,7 @@ from app.agents.summary_agent import SummaryAgent
 from app.config import AppConfig
 from app.infra.logger import JsonlLogger
 from app.mcp.protocol import MCPToolRegistry, ToolRequest
-from app.mcp.tools import get_market_snapshot, load_news_file
+from app.mcp.tools import get_fundamental_snapshot, get_market_snapshot, load_news_file
 from app.models.schemas import AgentOutput, Evidence, ReportBundle
 from app.rag.pipeline import RagPipeline
 from app.reports.writer import build_markdown_report
@@ -32,6 +32,7 @@ class FinanceResearchOrchestrator:
         self.rag = RagPipeline(config, self.logger)
         self.registry = MCPToolRegistry()
         self.registry.register("market_snapshot", get_market_snapshot)
+        self.registry.register("fundamental_snapshot", get_fundamental_snapshot)
         self.registry.register("load_news_file", load_news_file)
 
         self.fundamental = FundamentalAgent()
@@ -45,7 +46,11 @@ class FinanceResearchOrchestrator:
         evidence = self.rag.retrieve(query, top_k=self.config.top_k)
 
         market = self.registry.execute(ToolRequest(tool_name="market_snapshot", args={"ticker": ticker}))
+        fundamental = self.registry.execute(ToolRequest(tool_name="fundamental_snapshot", args={"ticker": ticker}))
         self.logger.log("mcp_call", {"tool": "market_snapshot", "ok": market.ok, "data": market.data})
+        self.logger.log("mcp_call", {"tool": "fundamental_snapshot", "ok": fundamental.ok, "data": fundamental.data})
+
+        evidence = self._inject_mcp_evidence(evidence, market.data if market.ok else None, fundamental.data if fundamental.ok else None)
 
         outputs = self._run_agents(ticker, evidence)
         summary = self.summary.run(ticker, outputs, evidence)
@@ -60,6 +65,59 @@ class FinanceResearchOrchestrator:
             },
         )
         return bundle
+
+    def _inject_mcp_evidence(
+        self,
+        evidence: list[Evidence],
+        market: dict | None,
+        fundamental: dict | None,
+    ) -> list[Evidence]:
+        enhanced = list(evidence)
+        if market and market.get("price") is not None:
+            enhanced.insert(
+                0,
+                Evidence(
+                    source_id="mcp_market_snapshot",
+                    title=f"{market.get('ticker', '')} market snapshot",
+                    content=(
+                        f"最新价={_fmt_num(market.get('price'))} {market.get('currency', '')}，"
+                        f"日内涨跌幅={_fmt_num(market.get('change_percent'))}% ，"
+                        f"日高={_fmt_num(market.get('day_high'))}，"
+                        f"日低={_fmt_num(market.get('day_low'))}，"
+                        f"PE={_fmt_num(market.get('pe'))}，"
+                        f"Forward PE={_fmt_num(market.get('forward_pe'))}，"
+                        f"PB={_fmt_num(market.get('pb'))}，"
+                        f"市值={_fmt_num(market.get('market_cap'))}。"
+                    ),
+                    score=5.0,
+                    metadata={"from": "mcp", "tool": "market_snapshot"},
+                ),
+            )
+
+        if fundamental:
+            enhanced.insert(
+                1 if enhanced else 0,
+                Evidence(
+                    source_id="mcp_fundamental_snapshot",
+                    title=f"{fundamental.get('ticker', '')} fundamental snapshot",
+                    content=(
+                        f"营收增速={_fmt_pct(fundamental.get('revenue_growth'))}，"
+                        f"利润增速={_fmt_pct(fundamental.get('earnings_growth'))}，"
+                        f"毛利率={_fmt_pct(fundamental.get('gross_margin'))}，"
+                        f"营业利润率={_fmt_pct(fundamental.get('operating_margin'))}，"
+                        f"净利率={_fmt_pct(fundamental.get('profit_margin'))}，"
+                        f"ROE={_fmt_pct(fundamental.get('return_on_equity'))}，"
+                        f"自由现金流={_fmt_num(fundamental.get('free_cash_flow'))}，"
+                        f"总现金={_fmt_num(fundamental.get('total_cash'))}，"
+                        f"Trailing PE={_fmt_num(fundamental.get('trailing_pe'))}，"
+                        f"Forward PE={_fmt_num(fundamental.get('forward_pe'))}，"
+                        f"P/B={_fmt_num(fundamental.get('price_to_book'))}。"
+                    ),
+                    score=4.8,
+                    metadata={"from": "mcp", "tool": "fundamental_snapshot"},
+                ),
+            )
+        return enhanced
 
     def _run_agents(self, ticker: str, evidence: list[Evidence]) -> list[AgentOutput]:
         if self.config.enable_langgraph:
@@ -124,3 +182,27 @@ class FinanceResearchOrchestrator:
         app = graph.compile()
         state = app.invoke({"outputs": []})
         return state["outputs"]
+
+
+def _fmt_num(v: object) -> str:
+    if v is None:
+        return "N/A"
+    try:
+        num = float(v)
+    except Exception:  # noqa: BLE001
+        return "N/A"
+    if abs(num) >= 1_000_000_000:
+        return f"{num / 1_000_000_000:.2f}B"
+    if abs(num) >= 1_000_000:
+        return f"{num / 1_000_000:.2f}M"
+    return f"{num:.2f}"
+
+
+def _fmt_pct(v: object) -> str:
+    if v is None:
+        return "N/A"
+    try:
+        num = float(v) * 100
+    except Exception:  # noqa: BLE001
+        return "N/A"
+    return f"{num:.2f}%"
