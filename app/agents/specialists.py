@@ -2,6 +2,7 @@
 
 from app.agents.base import BaseAgent
 from app.models.schemas import AgentOutput, Evidence
+from app.models.sentiment_risk import infer_news_sentiment_and_risk_5level
 
 
 def _citation(index: int) -> str:
@@ -25,6 +26,21 @@ def _ensure_cited(text: str, default_idx: int = 1) -> str:
     if "[E" in text:
         return text
     return f"{text} {_citation(default_idx)}"
+
+
+def _evidence_ref(evidence: list[Evidence], target: Evidence) -> int:
+    for i, ev in enumerate(evidence, start=1):
+        if ev is target:
+            return i
+    for i, ev in enumerate(evidence, start=1):
+        if ev.source_id == target.source_id and ev.title == target.title:
+            return i
+    return 1
+
+
+def _news_like(e: Evidence) -> bool:
+    s = f"{e.title} {e.source_id}".lower()
+    return "news" in s or "8-k" in s or "rss" in s
 
 
 class FundamentalAgent(BaseAgent):
@@ -133,6 +149,25 @@ class NewsAgent(BaseAgent):
     name = "新闻"
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
+        news_evs = [ev for ev in evidence if _news_like(ev)]
+        if not news_evs:
+            news_evs = evidence[:2]
+
+        scored_rows: list[str] = []
+        sent_lv = []
+        risk_lv = []
+        for ev in news_evs[:3]:
+            r = infer_news_sentiment_and_risk_5level(ev.content)
+            ref = _evidence_ref(evidence, ev)
+            sent_lv.append(r.sentiment_level)
+            risk_lv.append(r.risk_level)
+            scored_rows.append(
+                f"- [E{ref}] 情感={r.sentiment_level}({r.sentiment_label})，风险={r.risk_level}({r.risk_label})，触发词={','.join(r.reasons[:3]) or '无'}"
+            )
+
+        avg_sent = round(sum(sent_lv) / max(len(sent_lv), 1), 2)
+        avg_risk = round(sum(risk_lv) / max(len(risk_lv), 1), 2)
+
         analysis = "\n".join(
             [
                 f"{ticker} 新闻面分析关注事件冲击、预期差与情绪扩散路径。",
@@ -142,9 +177,13 @@ class NewsAgent(BaseAgent):
                 "- 预期变化：判断新闻是否改变市场对利润和增长的预期。",
                 "- 持续性：区分一次性噪音与中期趋势信号。",
                 "",
+                "情感/风险模型（1~5级）：",
+                f"- 平均情感等级：{avg_sent}（1=极负面，5=极正面）",
+                f"- 平均风险等级：{avg_risk}（1=极低风险，5=极高风险）",
+                *scored_rows,
+                "",
                 "证据解读：",
-                _evidence_line(evidence, 2),
-                _evidence_line(evidence, 4),
+                *[_evidence_line(evidence, _evidence_ref(evidence, ev)-1) for ev in news_evs[:2]],
                 "",
                 "风险提示：",
                 "- 新闻驱动行情通常波动更快，回撤也更陡。",
@@ -155,9 +194,11 @@ class NewsAgent(BaseAgent):
             ]
         )
 
+        ref1 = _evidence_ref(evidence, news_evs[0]) if news_evs else 1
+        ref2 = _evidence_ref(evidence, news_evs[1]) if len(news_evs) > 1 else ref1
         conclusions = [
-            _ensure_cited(f"{ticker} 新闻面仍是短期波动主因，需高频复盘 {_citation(3)}", 3),
-            _ensure_cited(f"当前信息对中期逻辑偏中性到正向，但需继续验证 {_citation(5)}", 5),
-            _ensure_cited("建议避免基于单条新闻进行重仓决策 [E3]", 3),
+            _ensure_cited(f"{ticker} 新闻情感等级均值为{avg_sent}，短期情绪影响不可忽视 [E{ref1}]", ref1),
+            _ensure_cited(f"{ticker} 新闻风险等级均值为{avg_risk}，建议保持动态风控 [E{ref2}]", ref2),
+            _ensure_cited(f"建议避免基于单条新闻进行重仓决策 [E{ref1}]", ref1),
         ]
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
