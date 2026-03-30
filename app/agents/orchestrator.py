@@ -10,6 +10,7 @@ from app.config import AppConfig
 from app.infra.logger import JsonlLogger
 from app.mcp.protocol import FASTMCP_AVAILABLE, FastMCPServerAdapter, LocalMCPServer, MultiServerMCPClient, ToolRequest
 from app.mcp.tools import get_fundamental_snapshot, get_market_snapshot, load_news_file
+from app.models.llm_client import build_llm_from_config
 from app.models.schemas import AgentOutput, Evidence, ReportBundle
 from app.rag.pipeline import RagPipeline
 from app.reports.writer import build_markdown_report
@@ -63,11 +64,13 @@ class FinanceResearchOrchestrator:
         self.mcp.register_server(finance_server)
         self.mcp.register_server(kb_server)
 
-        self.fundamental = FundamentalAgent()
-        self.technical = TechnicalAgent()
-        self.valuation = ValuationAgent()
-        self.news = NewsAgent()
-        self.summary = SummaryAgent()
+        self.llm = build_llm_from_config(config)
+        self.fundamental = FundamentalAgent(self.llm)
+        self.technical = TechnicalAgent(self.llm)
+        self.valuation = ValuationAgent(self.llm)
+        self.news = NewsAgent(self.llm)
+        self.summary = SummaryAgent(self.llm)
+        self.logger.log("llm_runtime", {"enabled": self.llm is not None, "model": config.llm_model})
 
     def run(self, ticker: str) -> ReportBundle:
         query = f"{ticker} 基本面 技术面 估值 新闻 风险"
@@ -240,3 +243,7 @@ def _fmt_pct(v: object) -> str:
     except Exception:  # noqa: BLE001
         return "N/A"
     return f"{num:.2f}%"
+
+
+
+

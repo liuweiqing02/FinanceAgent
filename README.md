@@ -54,6 +54,32 @@ cp .env.example .env
 
 建议把 `SEC_USER_AGENT` 改成你自己的标识（SEC 接口要求）。
 
+
+### 3.2.1 大模型接口（百炼 / OpenAI 兼容）
+
+本项目支持 **OpenAI-Compatible** 协议，Agent 可直接切换不同供应商。
+
+示例：阿里云百炼（DashScope 兼容）
+
+```bash
+LLM_ENABLED=true
+LLM_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_API_KEY=你的百炼API Key
+LLM_MODEL=qwen-plus
+```
+
+示例：OpenAI
+
+```bash
+LLM_ENABLED=true
+LLM_API_BASE=https://api.openai.com/v1
+LLM_API_KEY=你的OpenAI API Key
+LLM_MODEL=gpt-4.1-mini
+```
+
+说明：
+- 只要接口兼容 `/chat/completions`，即可接入。
+- 未开启 `LLM_ENABLED` 时，系统自动回退为规则模板模式（离线可跑）。
 ### 3.3 构建真实知识库（批量）
 
 ```bash
@@ -93,3 +119,4 @@ pytest
 - 单元测试：切块、检索、情感/风险、知识库构建、真实采集器解析、内容质量
 - 集成测试：报告生成与富文本结构验收
 - e2e smoke：命令行全流程
+

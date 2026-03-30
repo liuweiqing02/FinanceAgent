@@ -14,6 +14,10 @@ except Exception:  # noqa: BLE001
 load_dotenv()
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(slots=True)
 class AppConfig:
     """全局配置对象。"""
@@ -31,7 +35,16 @@ class AppConfig:
     bm25_weight: float = float(os.getenv("BM25_WEIGHT", "0.4"))
     vector_weight: float = float(os.getenv("VECTOR_WEIGHT", "0.6"))
     rerank_top_n: int = int(os.getenv("RERANK_TOP_N", "5"))
-    enable_langgraph: bool = os.getenv("ENABLE_LANGGRAPH", "true").lower() == "true"
+    enable_langgraph: bool = _env_bool("ENABLE_LANGGRAPH", "true")
+
+    # LLM（OpenAI-Compatible）配置：支持百炼兼容接口与 OpenAI。
+    llm_enabled: bool = _env_bool("LLM_ENABLED", "false")
+    llm_api_base: str = os.getenv("LLM_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    llm_api_key: str = os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    llm_model: str = os.getenv("LLM_MODEL", "qwen-plus")
+    llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
+    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "1400"))
 
 
 def get_config() -> AppConfig:

@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
+import json
 import re
+from typing import Any
 
 from app.agents.base import BaseAgent
 from app.models.schemas import AgentOutput, Evidence
@@ -75,8 +77,85 @@ def _evidence_line(ref: int, ev: Evidence, max_len: int = 140) -> str:
     return f"- [E{ref}] {ev.title}（score={ev.score}）：{clean}"
 
 
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n", "", text)
+        text = re.sub(r"\n```$", "", text)
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:  # noqa: BLE001
+        pass
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _llm_rewrite(
+    *,
+    llm: Any | None,
+    agent_name: str,
+    ticker: str,
+    topic: str,
+    analysis: str,
+    conclusions: list[str],
+    refs: list[tuple[int, Evidence]],
+) -> tuple[str, list[str]]:
+    if llm is None:
+        return analysis, conclusions
+
+    evidence_text = "\n".join(
+        f"[E{ref}] {ev.title} | {ev.content[:500].replace(chr(10), ' ')}" for ref, ev in refs[:3]
+    )
+    system_prompt = "你是资深股票分析师，请输出可审计、可落地、结论有证据编号的中文分析。"
+    user_prompt = (
+        f"请重写 {ticker} 的{agent_name}分析，主题={topic}。\n"
+        "必须满足：\n"
+        "1) analysis 至少 220 字，不能空话，必须出现具体数据字段与因果解释。\n"
+        "2) conclusions 输出 3~4 条，每条必须包含 [E数字] 引用。\n"
+        "3) 如果证据不足，明确写出不足项，但不要编造数据。\n"
+        "4) 返回 JSON：{\"analysis\":\"...\",\"conclusions\":[\"...\"]}。\n"
+        f"可用证据:\n{evidence_text}\n\n"
+        f"当前草稿analysis:\n{analysis}\n\n"
+        f"当前草稿conclusions:\n{json.dumps(conclusions, ensure_ascii=False)}"
+    )
+
+    try:
+        text = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        obj = _extract_json_block(text)
+        if not obj:
+            return analysis, conclusions
+        new_analysis = str(obj.get("analysis", "")).strip()
+        new_conclusions = obj.get("conclusions", [])
+        if not isinstance(new_conclusions, list):
+            return analysis, conclusions
+
+        clean_conclusions: list[str] = []
+        fallback_ref = refs[0][0] if refs else 1
+        for c in new_conclusions:
+            s = _ensure_cited(str(c).strip(), fallback_ref)
+            if s:
+                clean_conclusions.append(s)
+        if len(clean_conclusions) < 3:
+            return analysis, conclusions
+        if len(new_analysis) < 80:
+            return analysis, conclusions
+        return new_analysis, clean_conclusions[:4]
+    except Exception:  # noqa: BLE001
+        return analysis, conclusions
+
+
 class FundamentalAgent(BaseAgent):
     name = "基本面"
+
+    def __init__(self, llm: Any | None = None) -> None:
+        self.llm = llm
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "fundamental", limit=3)
@@ -120,11 +199,23 @@ class FundamentalAgent(BaseAgent):
             _ensure_cited(f"若营收与利润增速同步改善，估值中枢存在上修基础 [E{first_ref}]", first_ref),
             _ensure_cited(f"若现金流覆盖能力下降，需要下调仓位容忍区间 [E{first_ref}]", first_ref),
         ]
+        analysis, conclusions = _llm_rewrite(
+            llm=self.llm,
+            agent_name=self.name,
+            ticker=ticker,
+            topic="fundamental",
+            analysis=analysis,
+            conclusions=conclusions,
+            refs=refs,
+        )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
 
 class TechnicalAgent(BaseAgent):
     name = "技术面"
+
+    def __init__(self, llm: Any | None = None) -> None:
+        self.llm = llm
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "technical", limit=3)
@@ -165,11 +256,23 @@ class TechnicalAgent(BaseAgent):
             _ensure_cited(f"若量价出现背离，需要缩短持仓评估周期 [E{first_ref}]", first_ref),
             _ensure_cited(f"跌破关键支撑位时应先执行风控再讨论反弹 [E{first_ref}]", first_ref),
         ]
+        analysis, conclusions = _llm_rewrite(
+            llm=self.llm,
+            agent_name=self.name,
+            ticker=ticker,
+            topic="technical",
+            analysis=analysis,
+            conclusions=conclusions,
+            refs=refs,
+        )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
 
 class ValuationAgent(BaseAgent):
     name = "估值"
+
+    def __init__(self, llm: Any | None = None) -> None:
+        self.llm = llm
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "valuation", limit=3)
@@ -210,11 +313,23 @@ class ValuationAgent(BaseAgent):
             _ensure_cited(f"若增长与利润率同步改善，估值溢价才更可持续 [E{first_ref}]", first_ref),
             _ensure_cited(f"建议按安全边际设定分批买入和减仓阈值 [E{first_ref}]", first_ref),
         ]
+        analysis, conclusions = _llm_rewrite(
+            llm=self.llm,
+            agent_name=self.name,
+            ticker=ticker,
+            topic="valuation",
+            analysis=analysis,
+            conclusions=conclusions,
+            refs=refs,
+        )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
 
 
 class NewsAgent(BaseAgent):
     name = "新闻"
+
+    def __init__(self, llm: Any | None = None) -> None:
+        self.llm = llm
 
     def run(self, ticker: str, evidence: list[Evidence]) -> AgentOutput:
         refs = _select_evidence(evidence, "news", limit=3)
@@ -265,4 +380,13 @@ class NewsAgent(BaseAgent):
             _ensure_cited(f"{ticker} 新闻风险均值={avg_risk}，建议执行事件驱动风控 [E{second_ref}]", second_ref),
             _ensure_cited(f"重大仓位决策应至少基于两条独立新闻证据交叉验证 [E{first_ref}]", first_ref),
         ]
+        analysis, conclusions = _llm_rewrite(
+            llm=self.llm,
+            agent_name=self.name,
+            ticker=ticker,
+            topic="news",
+            analysis=analysis,
+            conclusions=conclusions,
+            refs=refs,
+        )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
