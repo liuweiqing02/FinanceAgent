@@ -8,7 +8,7 @@ from app.agents.specialists import FundamentalAgent, NewsAgent, TechnicalAgent, 
 from app.agents.summary_agent import SummaryAgent
 from app.config import AppConfig
 from app.infra.logger import JsonlLogger
-from app.mcp.protocol import MCPToolRegistry, ToolRequest
+from app.mcp.protocol import LocalMCPServer, MultiServerMCPClient, ToolRequest
 from app.mcp.tools import get_fundamental_snapshot, get_market_snapshot, load_news_file
 from app.models.schemas import AgentOutput, Evidence, ReportBundle
 from app.rag.pipeline import RagPipeline
@@ -30,10 +30,36 @@ class FinanceResearchOrchestrator:
         self.config = config
         self.logger = JsonlLogger(Path("logs/rag_trace.jsonl"))
         self.rag = RagPipeline(config, self.logger)
-        self.registry = MCPToolRegistry()
-        self.registry.register("market_snapshot", get_market_snapshot)
-        self.registry.register("fundamental_snapshot", get_fundamental_snapshot)
-        self.registry.register("load_news_file", load_news_file)
+
+        self.mcp = MultiServerMCPClient()
+        finance_server = LocalMCPServer("finance_data")
+        finance_server.register_tool(
+            name="market_snapshot",
+            fn=get_market_snapshot,
+            description="获取股票行情与估值快照",
+            input_schema={"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]},
+        )
+        finance_server.register_tool(
+            name="fundamental_snapshot",
+            fn=get_fundamental_snapshot,
+            description="获取股票财务核心指标快照",
+            input_schema={"type": "object", "properties": {"ticker": {"type": "string"}}, "required": ["ticker"]},
+        )
+
+        kb_server = LocalMCPServer("knowledge_base")
+        kb_server.register_tool(
+            name="load_news_file",
+            fn=load_news_file,
+            description="从知识库读取新闻文档",
+            input_schema={
+                "type": "object",
+                "properties": {"base_dir": {"type": "string"}, "ticker": {"type": "string"}},
+                "required": ["base_dir", "ticker"],
+            },
+        )
+
+        self.mcp.register_server(finance_server)
+        self.mcp.register_server(kb_server)
 
         self.fundamental = FundamentalAgent()
         self.technical = TechnicalAgent()
@@ -45,10 +71,16 @@ class FinanceResearchOrchestrator:
         query = f"{ticker} 基本面 技术面 估值 新闻 风险"
         evidence = self.rag.retrieve(query, top_k=self.config.top_k)
 
-        market = self.registry.execute(ToolRequest(tool_name="market_snapshot", args={"ticker": ticker}))
-        fundamental = self.registry.execute(ToolRequest(tool_name="fundamental_snapshot", args={"ticker": ticker}))
-        self.logger.log("mcp_call", {"tool": "market_snapshot", "ok": market.ok, "data": market.data})
-        self.logger.log("mcp_call", {"tool": "fundamental_snapshot", "ok": fundamental.ok, "data": fundamental.data})
+        tools = [f"{t.server}.{t.name}" for t in self.mcp.list_tools()]
+        self.logger.log("mcp_tools", {"count": len(tools), "tools": tools})
+
+        market = self.mcp.call_tool(ToolRequest(server="finance_data", tool_name="market_snapshot", args={"ticker": ticker}))
+        fundamental = self.mcp.call_tool(ToolRequest(server="finance_data", tool_name="fundamental_snapshot", args={"ticker": ticker}))
+        self.logger.log("mcp_call", {"server": market.server, "tool": market.tool_name, "ok": market.ok, "data": market.data})
+        self.logger.log(
+            "mcp_call",
+            {"server": fundamental.server, "tool": fundamental.tool_name, "ok": fundamental.ok, "data": fundamental.data},
+        )
 
         evidence = self._inject_mcp_evidence(evidence, market.data if market.ok else None, fundamental.data if fundamental.ok else None)
 
@@ -90,7 +122,7 @@ class FinanceResearchOrchestrator:
                         f"市值={_fmt_num(market.get('market_cap'))}。"
                     ),
                     score=5.0,
-                    metadata={"from": "mcp", "tool": "market_snapshot"},
+                    metadata={"from": "mcp", "tool": "market_snapshot", "server": "finance_data"},
                 ),
             )
 
@@ -114,7 +146,7 @@ class FinanceResearchOrchestrator:
                         f"P/B={_fmt_num(fundamental.get('price_to_book'))}。"
                     ),
                     score=4.8,
-                    metadata={"from": "mcp", "tool": "fundamental_snapshot"},
+                    metadata={"from": "mcp", "tool": "fundamental_snapshot", "server": "finance_data"},
                 ),
             )
         return enhanced
