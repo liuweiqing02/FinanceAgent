@@ -162,4 +162,21 @@ def _llm_rewrite_summary(
             p_analysis = p_analysis + "\n\n注：本段由 LLM 文本抽取生成（JSON 校验失败后降级）。"
             return p_analysis, p_conc
 
-    return analysis, conclusions
+    try:
+        free_prompt = (
+            f"请直接输出 {ticker} 的综合结论：正文不少于260字，并给出4条结论。"
+            "每条结论包含 [E数字]，不要 JSON，不要解释。"
+            f"专家输出：\n{block}\n\n证据：\n{ev}"
+        )
+        free_text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性。", user_prompt=free_prompt)
+        parsed2 = _extract_from_plain_text(free_text, 1)
+        if parsed2 is not None:
+            p_analysis, p_conc = parsed2
+            p_analysis = p_analysis + "\n\n注：本段由 LLM 自由文本生成并抽取（JSON 多轮失败后降级）。"
+            return p_analysis, p_conc
+    except Exception as exc:  # noqa: BLE001
+        last_error = f"{last_error}; 自由文本调用异常: {exc}" if last_error else f"自由文本调用异常: {exc}"
+
+    fallback_note = f"\n\n注：LLM 重写未生效，已回退模板。原因：{last_error[:180] or '未知'}。"
+    return analysis + fallback_note, conclusions
+

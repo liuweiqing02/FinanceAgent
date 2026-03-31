@@ -194,7 +194,7 @@ def _llm_rewrite(
         except Exception as exc:  # noqa: BLE001
             last_error = f"调用异常: {exc}"
 
-    # JSON 重试全部失败后，尝试文本抽取。
+    # JSON 重试全部失败后，先尝试对最后输出做文本抽取。
     if last_output:
         parsed = _extract_from_plain_text(last_output, fallback_ref)
         if parsed is not None:
@@ -202,7 +202,25 @@ def _llm_rewrite(
             p_analysis = p_analysis + "\n\n注：本段由 LLM 文本抽取生成（JSON 校验失败后降级）。"
             return p_analysis, p_conc
 
-    return analysis, conclusions
+    # 进一步降级：再让 LLM 直接输出自由文本，不再要求 JSON。
+    try:
+        free_prompt = (
+            f"请直接输出 {ticker} 的{agent_name}分析正文（不少于220字）和3条结论。"
+            "要求：每条结论都带 [E数字] 引用，不要 JSON，不要解释。"
+            f"可用证据：\n{evidence_text}"
+        )
+        free_text = llm.generate(system_prompt=system_prompt, user_prompt=free_prompt)
+        parsed2 = _extract_from_plain_text(free_text, fallback_ref)
+        if parsed2 is not None:
+            p_analysis, p_conc = parsed2
+            p_analysis = p_analysis + "\n\n注：本段由 LLM 自由文本生成并抽取（JSON 多轮失败后降级）。"
+            return p_analysis, p_conc
+    except Exception as exc:  # noqa: BLE001
+        last_error = f"{last_error}; 自由文本调用异常: {exc}" if last_error else f"自由文本调用异常: {exc}"
+
+    # 最后兜底：保留模板并显式标注失败原因，避免看起来像“悄悄没用 LLM”。
+    fallback_note = f"\n\n注：LLM 重写未生效，已回退模板。原因：{last_error[:180] or '未知'}。"
+    return analysis + fallback_note, conclusions
 
 
 class FundamentalAgent(BaseAgent):
@@ -452,3 +470,4 @@ class NewsAgent(BaseAgent):
             retry_max=self.retry_max,
         )
         return AgentOutput(name=self.name, analysis=analysis, conclusions=conclusions)
+
