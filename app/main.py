@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
 from app.agents.orchestrator import FinanceResearchOrchestrator
 from app.config import get_config
+from app.rag.evidence_backfill import backfill_kb_until_ready, evaluate_kb_completeness
 from app.rag.knowledge_builder import build_knowledge_base, ensure_sample_raw_data
 from app.rag.real_collectors import collect_real_raw_data
 
@@ -21,6 +22,8 @@ def main() -> None:
     parser.add_argument("--ticker", default="AAPL", help="股票代码")
     parser.add_argument("--kb-mode", default="auto", choices=["auto", "real", "sample"], help="知识库构建模式")
     parser.add_argument("--sec-user-agent", default=None, help="SEC 抓取 User-Agent，默认读取 SEC_USER_AGENT")
+    parser.add_argument("--evidence-backfill", action="store_true", help="生成前执行证据补齐与完整度检查")
+    parser.add_argument("--backfill-rounds", type=int, default=2, help="证据补齐最大轮数")
     args = parser.parse_args()
 
     config = get_config()
@@ -33,7 +36,7 @@ def main() -> None:
                 tickers=[args.ticker.upper()],
                 sec_user_agent=args.sec_user_agent or config.sec_user_agent,
                 filing_limit=4,
-                news_limit=4,
+                news_limit=8,
             )
             print(
                 "真实数据采集完成: "
@@ -57,6 +60,33 @@ def main() -> None:
         include_glob = "finance_events.jsonl"
 
     build_knowledge_base(config.raw_data_dir, config.knowledge_base_dir, include_glob=include_glob)
+
+    if args.evidence_backfill:
+        sec_ua = args.sec_user_agent or config.sec_user_agent
+        comp = backfill_kb_until_ready(
+            config,
+            args.ticker.upper(),
+            sec_user_agent=sec_ua,
+            max_rounds=args.backfill_rounds,
+        )
+        print(
+            "证据完整度: "
+            f"fundamental={comp.fundamental_metrics}({'ok' if comp.fundamental_ok else 'missing'}), "
+            f"valuation={comp.valuation_metrics}({'ok' if comp.valuation_ok else 'missing'}), "
+            f"news={comp.news_events}({'ok' if comp.news_ok else 'missing'})"
+        )
+    else:
+        comp = evaluate_kb_completeness(
+            config.knowledge_base_dir,
+            args.ticker.upper(),
+            min_fundamental_metrics=config.fundamental_min_metrics,
+            min_valuation_metrics=config.valuation_min_metrics,
+            min_news_events=config.news_min_events,
+        )
+        print(
+            "证据完整度(未补齐): "
+            f"fundamental={comp.fundamental_metrics}, valuation={comp.valuation_metrics}, news={comp.news_events}"
+        )
 
     orchestrator = FinanceResearchOrchestrator(config)
     report = orchestrator.run(args.ticker.upper())

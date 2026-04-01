@@ -1,11 +1,15 @@
 ﻿from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.rag.ingestion import clean_text
+
+_MANIFEST_NAME = "_kb_manifest.json"
 
 
 @dataclass(slots=True)
@@ -17,6 +21,9 @@ class RawKnowledgeItem:
     source: str
     url: str
     published_at: str
+    doc_id: str
+    updated_at: str
+    content_hash: str
 
 
 def ensure_sample_raw_data(raw_dir: Path) -> None:
@@ -113,11 +120,12 @@ def ensure_sample_raw_data(raw_dir: Path) -> None:
 
     with target.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            enr = _enrich_raw_row(row)
+            f.write(json.dumps(enr, ensure_ascii=False) + "\n")
 
 
 def build_knowledge_base(raw_dir: Path, knowledge_base_dir: Path, include_glob: str = "*.jsonl") -> list[Path]:
-    """将原始事件流数据构建为可检索知识库文档。"""
+    """将原始事件流数据构建为可检索知识库文档（增量更新）。"""
 
     raw_items = _load_raw_items(raw_dir, include_glob)
     grouped: dict[tuple[str, str], list[RawKnowledgeItem]] = defaultdict(list)
@@ -125,14 +133,40 @@ def build_knowledge_base(raw_dir: Path, knowledge_base_dir: Path, include_glob: 
         grouped[(item.ticker.upper(), item.topic.lower())].append(item)
 
     knowledge_base_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = knowledge_base_dir / _MANIFEST_NAME
+    old_manifest = _load_manifest(manifest_path)
+    new_manifest: dict[str, dict[str, str]] = {}
     outputs: list[Path] = []
 
     for (ticker, topic), items in grouped.items():
         items.sort(key=lambda x: x.published_at)
         text = _render_topic_markdown(ticker, topic, items)
-        output = knowledge_base_dir / f"{ticker}_{topic}.md"
-        output.write_text(text, encoding="utf-8")
+        source_id = f"{ticker}_{topic}"
+        output = knowledge_base_dir / f"{source_id}.md"
+
+        updated_at = _max_updated_at(items)
+        content_hash = _sha256(clean_text(text))
+        new_manifest[source_id] = {
+            "doc_id": source_id,
+            "updated_at": updated_at,
+            "hash": content_hash,
+            "path": output.name,
+        }
+
+        old = old_manifest.get(source_id, {})
+        if old.get("hash") != content_hash or not output.exists():
+            output.write_text(text, encoding="utf-8")
+
         outputs.append(output)
+
+    # 删除本轮不存在的旧文档（失效同步）
+    stale_ids = set(old_manifest.keys()) - set(new_manifest.keys())
+    for sid in stale_ids:
+        p = knowledge_base_dir / old_manifest.get(sid, {}).get("path", f"{sid}.md")
+        if p.exists():
+            p.unlink()
+
+    _save_manifest(manifest_path, new_manifest)
     return outputs
 
 
@@ -142,7 +176,7 @@ def _load_raw_items(raw_dir: Path, include_glob: str) -> list[RawKnowledgeItem]:
         for row in file.read_text(encoding="utf-8", errors="ignore").splitlines():
             if not row.strip():
                 continue
-            obj = json.loads(row)
+            obj = _enrich_raw_row(json.loads(row))
             items.append(
                 RawKnowledgeItem(
                     ticker=str(obj.get("ticker", "")).upper(),
@@ -152,6 +186,9 @@ def _load_raw_items(raw_dir: Path, include_glob: str) -> list[RawKnowledgeItem]:
                     source=str(obj.get("source", "unknown")).strip(),
                     url=str(obj.get("url", "")).strip(),
                     published_at=str(obj.get("published_at", "")).strip(),
+                    doc_id=str(obj.get("doc_id", "")).strip(),
+                    updated_at=str(obj.get("updated_at", "")).strip(),
+                    content_hash=str(obj.get("hash", "")).strip(),
                 )
             )
     return [x for x in items if x.ticker and x.content]
@@ -197,3 +234,67 @@ def _render_topic_markdown(ticker: str, topic: str, items: list[RawKnowledgeItem
         ]
     )
     return "\n".join(lines)
+
+
+def _enrich_raw_row(obj: dict) -> dict:
+    ticker = str(obj.get("ticker", "")).upper().strip()
+    topic = str(obj.get("topic", "general")).lower().strip()
+    title = str(obj.get("title", "未命名事件")).strip()
+    source = str(obj.get("source", "unknown")).strip()
+    url = str(obj.get("url", "")).strip()
+    published_at = str(obj.get("published_at", "")).strip()
+    updated_at = str(obj.get("updated_at") or published_at or obj.get("collected_at") or "").strip()
+    if not updated_at:
+        updated_at = datetime.now(timezone.utc).isoformat()
+
+    content = clean_text(str(obj.get("content", "")).strip())
+    content_hash = str(obj.get("hash") or obj.get("content_hash") or "").strip() or _sha256(content)
+
+    doc_id = str(obj.get("doc_id", "")).strip()
+    if not doc_id:
+        base = "|".join([ticker, topic, source, url, title, published_at])
+        doc_id = f"{ticker}_{topic}_{_sha256(base)[:12]}" if ticker else _sha256(base)[:16]
+
+    out = dict(obj)
+    out.update(
+        {
+            "ticker": ticker,
+            "topic": topic,
+            "title": title,
+            "source": source,
+            "url": url,
+            "published_at": published_at,
+            "updated_at": updated_at,
+            "doc_id": doc_id,
+            "hash": content_hash,
+            "content": content,
+        }
+    )
+    return out
+
+
+def _load_manifest(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return {str(k): v for k, v in obj.items() if isinstance(v, dict)}
+    except Exception:  # noqa: BLE001
+        return {}
+    return {}
+
+
+def _save_manifest(path: Path, manifest: dict[str, dict[str, str]]) -> None:
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _max_updated_at(items: list[RawKnowledgeItem]) -> str:
+    vals = [x.updated_at.strip() for x in items if x.updated_at.strip()]
+    if not vals:
+        return datetime.now(timezone.utc).isoformat()
+    return max(vals)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()

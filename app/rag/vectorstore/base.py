@@ -15,3 +15,8 @@ class VectorStore(ABC):
     @abstractmethod
     def query(self, embedding: list[float], top_k: int) -> list[tuple[Chunk, float]]:
         raise NotImplementedError
+
+    @abstractmethod
+    def delete_by_source_ids(self, source_ids: list[str]) -> None:
+        """删除属于指定 source_id 的所有向量块。"""
+        raise NotImplementedError

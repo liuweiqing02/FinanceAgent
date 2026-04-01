@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -16,12 +16,14 @@ class _MemoryRow:
 class ChromaVectorStore(VectorStore):
     """默认向量库实现。优先使用 Chroma，缺失时自动回退内存模式。"""
 
-    def __init__(self, collection: str, persist_dir: str) -> None:
+    def __init__(self, collection: str, persist_dir: str, *, enable_chroma: bool = True) -> None:
         self.collection_name = collection
         self.persist_dir = persist_dir
         self._mem: list[_MemoryRow] = []
         self._chroma = None
         self._col = None
+        if not enable_chroma:
+            return
         try:
             import chromadb
 
@@ -69,9 +71,26 @@ class ChromaVectorStore(VectorStore):
         rows.sort(key=lambda x: x[1], reverse=True)
         return rows[:top_k]
 
+    def delete_by_source_ids(self, source_ids: list[str]) -> None:
+        if not source_ids:
+            return
+
+        if self._col is not None:
+            for sid in source_ids:
+                try:
+                    self._col.delete(where={"source_id": sid})
+                except Exception:  # noqa: BLE001
+                    continue
+            return
+
+        sid_set = set(source_ids)
+        self._mem = [row for row in self._mem if row.chunk.source_id not in sid_set]
+
 
 def _cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(y * y for y in b)) or 1.0
     return dot / (na * nb)
+
+

@@ -22,7 +22,11 @@ def collect_documents(path: Path) -> list[RawDocument]:
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\b(?:us-gaap|xbrl|taxonomy|linkbase|namespace|dei)\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[A-Za-z0-9_-]{40,}", " ", text)
+    text = re.sub(r"\b[A-Za-z-]+:[A-Za-z0-9_]+\b", " ", text)
+    text = re.sub(r"\b\d{6,}\b", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()

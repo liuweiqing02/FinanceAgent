@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from app.config import AppConfig
+
 
 @dataclass(slots=True)
 class SentimentRiskResult:
@@ -21,6 +23,34 @@ class NewsSentimentRiskResult:
     sentiment_score: float
     risk_score: float
     reasons: list[str] = field(default_factory=list)
+
+
+class NewsSentimentRiskEngine:
+    """新闻情感/风险推理引擎接口。"""
+
+    def infer(self, text: str) -> NewsSentimentRiskResult:  # pragma: no cover - protocol-like
+        raise NotImplementedError
+
+
+def build_news_engine_from_config(config: AppConfig) -> NewsSentimentRiskEngine | None:
+    """根据配置构建本地模型推理引擎。"""
+
+    if not config.news_model_enabled:
+        return None
+
+    try:
+        from app.models.news_local_model import LocalNewsClassifier, LocalNewsModelConfig
+
+        return LocalNewsClassifier(
+            LocalNewsModelConfig(
+                base_model=config.news_model_base,
+                adapter_path=config.news_model_adapter,
+                device=config.news_model_device,
+                max_new_tokens=config.news_model_max_new_tokens,
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def infer_sentiment_and_risk(text: str) -> SentimentRiskResult:
@@ -48,9 +78,21 @@ def infer_sentiment_and_risk(text: str) -> SentimentRiskResult:
     return SentimentRiskResult(sentiment=sentiment, risk_level=risk, score=round(score, 3))
 
 
-def infer_news_sentiment_and_risk_5level(text: str) -> NewsSentimentRiskResult:
-    """新闻情感/风险 1~5 级推理。"""
+def infer_news_sentiment_and_risk_5level(
+    text: str,
+    engine: NewsSentimentRiskEngine | None = None,
+) -> NewsSentimentRiskResult:
+    """新闻情感/风险 1~5 级推理（优先模型，失败回退规则）。"""
 
+    if engine is not None:
+        try:
+            return engine.infer(text)
+        except Exception:  # noqa: BLE001
+            pass
+    return _infer_news_sentiment_and_risk_5level_rule(text)
+
+
+def _infer_news_sentiment_and_risk_5level_rule(text: str) -> NewsSentimentRiskResult:
     t = text.lower()
 
     risk_kw = {

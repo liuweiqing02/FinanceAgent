@@ -130,22 +130,30 @@ def _can_emit_trade_plan(evidence: list[Evidence], market_snapshot: dict | None)
     if market_snapshot is None or not _market_snapshot_ok(market_snapshot):
         return False
 
+    quality = _assess_evidence_quality(evidence)
+    if quality["high_quality"] < 3:
+        return False
+
     tags = 0
     for ev in evidence:
         t = f"{ev.title} {ev.source_id}".lower()
-        if "technical" in t or "valuation" in t:
-            if _is_readable(ev.content) and ev.score >= 1.0:
-                tags += 1
+        if ("technical" in t or "valuation" in t) and _is_readable(ev.content) and ev.score >= 1.0:
+            tags += 1
     return tags >= 2
 
 
 def _is_readable(text: str) -> bool:
-    if not text or len(text.strip()) < 40:
+    body = text.strip()
+    if len(body) < 40:
         return False
-    bad_tokens = ["xbrl", "us-gaap", "v95cux", "http", "0000"]
-    low = text.lower()
+    low = body.lower()
+    bad_tokens = ["xbrl", "us-gaap", "v95cux", "http", "0000", "taxonomy", "false fy", "p7y", "p2y"]
     hit = sum(1 for x in bad_tokens if x in low)
-    return hit <= 2
+    if hit >= 2:
+        return False
+    if low.count("n/a") >= 8:
+        return False
+    return True
 
 
 def _readable_snippet(text: str, max_len: int = 180) -> str:

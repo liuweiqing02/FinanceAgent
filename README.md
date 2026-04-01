@@ -13,6 +13,8 @@
 - 向量数据库：默认 Chroma（不可用时自动回退内存模式）
 - 向量库抽象接口 `VectorStore`（便于切换 Milvus/pgvector）
 - Hybrid Retrieval（BM25 + 向量检索）
+- 可切换本地 Embedding（Hash / BGE / E5，失败自动回退 Hash）
+- 可切换本地 Reranker（Simple / Cross-Encoder，失败自动回退 Simple）
 - 强制证据引用与可追溯报告
 - 检索与生成可观测日志（query、召回、得分、结论）
 
@@ -119,4 +121,47 @@ pytest
 - 单元测试：切块、检索、情感/风险、知识库构建、真实采集器解析、内容质量
 - 集成测试：报告生成与富文本结构验收
 - e2e smoke：命令行全流程
+
+
+## 6. 本地新闻情感/风险模型（方案A）
+
+### 6.1 为什么这样设计
+
+- 新闻情感/风险属于高频结构化判断，适合本地小模型承接，延迟更低、成本更稳。
+- 在 12G 显存下，推荐 `Qwen2.5-1.5B-Instruct + QLoRA(4bit)`。
+- 线上推理链路：`本地LoRA模型优先 -> 规则模型兜底`，保证可运行。
+
+### 6.2 安装模型依赖
+
+```bash
+pip install -r requirements-ml.txt
+```
+
+### 6.3 用你的数据集训练 LoRA
+
+```bash
+python -m app.models.train_news_lora \
+  --risk-csv "C:/pycode/offer/Finance/risk_deepseek_cleaned_nasdaq_news_full.csv" \
+  --sentiment-csv "C:/pycode/offer/Finance/sentiment_deepseek_new_cleaned_nasdaq_news_full.csv" \
+  --base-model "Qwen/Qwen2.5-1.5B-Instruct" \
+  --output-dir "models/news_qwen_lora" \
+  --max-samples 80000 \
+  --num-train-epochs 1 \
+  --batch-size 1 \
+  --grad-accum 16
+```
+
+### 6.4 启用本地新闻模型
+
+在 `.env` 中设置：
+
+```bash
+NEWS_MODEL_ENABLED=true
+NEWS_MODEL_BASE=Qwen/Qwen2.5-1.5B-Instruct
+NEWS_MODEL_ADAPTER=models/news_qwen_lora
+NEWS_MODEL_DEVICE=auto
+NEWS_MODEL_MAX_NEW_TOKENS=96
+```
+
+系统运行时会在 `logs/rag_trace.jsonl` 记录 `news_model_runtime` 是否生效。
 

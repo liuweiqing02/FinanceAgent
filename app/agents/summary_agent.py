@@ -60,6 +60,12 @@ def _ensure_citation(text: str, default_idx: int = 1) -> str:
     return text + f" [E{default_idx}]"
 
 
+
+def _contains_forbidden_external_claims(text: str, evidence_text: str) -> bool:
+    low = (text or "").lower()
+    ev_low = (evidence_text or "").lower()
+    markers = ["bloomberg", "factset", "consensus", "ref:"]
+    return any((m in low) and (m not in ev_low) for m in markers)
 def _extract_json_block(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if text.startswith("```"):
@@ -127,12 +133,14 @@ def _llm_rewrite_summary(
             "2) analysis 至少 260 字，必须覆盖一致点、分歧点、主要风险、执行建议。\n"
             "3) conclusions 给 4 条，每条必须有 [E数字]。\n"
             "4) 不得编造证据，不足就明确写证据不足。\n"
+            "5) 只写投资分析与执行策略，不要评价系统管道、解析故障、编码问题、RAG实现细节。\n"
+            "6) 语气务实克制，避免极端化表述。\n"
             f"专家输出:\n{block}\n\n证据:\n{ev}\n\n当前草稿:\n{analysis}\n{json.dumps(conclusions, ensure_ascii=False)}"
             f"{fix_hint}"
         )
 
         try:
-            text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性。", user_prompt=user_prompt)
+            text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性，输出克制、可落地结论。", user_prompt=user_prompt)
             last_output = text
             obj = _extract_json_block(text)
             if not obj:
@@ -166,6 +174,7 @@ def _llm_rewrite_summary(
         free_prompt = (
             f"请直接输出 {ticker} 的综合结论：正文不少于260字，并给出4条结论。"
             "每条结论包含 [E数字]，不要 JSON，不要解释。"
+            "仅写投资分析与执行策略，不要讨论系统实现细节。"
             f"专家输出：\n{block}\n\n证据：\n{ev}"
         )
         free_text = llm.generate(system_prompt="你是买方投研负责人，强调证据链与可执行性。", user_prompt=free_prompt)

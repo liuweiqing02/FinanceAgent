@@ -12,3 +12,13 @@ reports_output/
 logs/
 .chroma/
 .env
+__run_main.log
+
+# Environments
+.venv/
+.venv-ml/
+
+# Generated data / artifacts
+data/tmp_local_model_smoke/
+data/tmp_local_model_smoke_escalated/
+models/news_qwen_lora/

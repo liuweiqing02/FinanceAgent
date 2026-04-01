@@ -2,7 +2,9 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from operator import add
 from pathlib import Path
+from typing import Annotated, TypedDict
 
 from app.agents.specialists import FundamentalAgent, NewsAgent, TechnicalAgent, ValuationAgent
 from app.agents.summary_agent import SummaryAgent
@@ -12,6 +14,7 @@ from app.mcp.protocol import FASTMCP_AVAILABLE, FastMCPServerAdapter, LocalMCPSe
 from app.mcp.tools import get_fundamental_snapshot, get_market_snapshot, load_news_file
 from app.models.llm_client import build_llm_from_config
 from app.models.schemas import AgentOutput, Evidence, ReportBundle
+from app.models.sentiment_risk import build_news_engine_from_config
 from app.rag.pipeline import RagPipeline
 from app.reports.writer import build_markdown_report
 
@@ -65,16 +68,25 @@ class FinanceResearchOrchestrator:
         self.mcp.register_server(kb_server)
 
         self.llm = build_llm_from_config(config)
-        self.fundamental = FundamentalAgent(self.llm)
-        self.technical = TechnicalAgent(self.llm)
-        self.valuation = ValuationAgent(self.llm)
-        self.news = NewsAgent(self.llm)
+        self.news_engine = build_news_engine_from_config(config)
+        self.fundamental = FundamentalAgent(self.llm, config=self.config, mcp_client=self.mcp, kb_base_dir=str(self.config.knowledge_base_dir), logger=self.logger)
+        self.technical = TechnicalAgent(self.llm, config=self.config, mcp_client=self.mcp, kb_base_dir=str(self.config.knowledge_base_dir), logger=self.logger)
+        self.valuation = ValuationAgent(self.llm, config=self.config, mcp_client=self.mcp, kb_base_dir=str(self.config.knowledge_base_dir), logger=self.logger)
+        self.news = NewsAgent(self.llm, news_engine=self.news_engine, config=self.config, mcp_client=self.mcp, kb_base_dir=str(self.config.knowledge_base_dir), logger=self.logger)
         self.summary = SummaryAgent(self.llm)
         self.logger.log("llm_runtime", {"enabled": self.llm is not None, "model": config.llm_model})
+        self.logger.log(
+            "news_model_runtime",
+            {
+                "enabled": self.news_engine is not None,
+                "base_model": config.news_model_base,
+                "adapter": config.news_model_adapter,
+            },
+        )
 
     def run(self, ticker: str) -> ReportBundle:
         query = f"{ticker} 基本面 技术面 估值 新闻 风险"
-        evidence = self.rag.retrieve(query, top_k=self.config.top_k)
+        evidence = self._retrieve_scoped_evidence(ticker)
 
         tools = [f"{t.server}.{t.name}" for t in self.mcp.list_tools()]
         self.logger.log("mcp_tools", {"count": len(tools), "tools": tools, "backend": "fastmcp" if FASTMCP_AVAILABLE else "local"})
@@ -103,6 +115,32 @@ class FinanceResearchOrchestrator:
         )
         return bundle
 
+    def _retrieve_scoped_evidence(self, ticker: str) -> list[Evidence]:
+        topic_queries = {
+            "fundamental": f"{ticker} 基本面 财务 营收 利润 现金流",
+            "technical": f"{ticker} 技术面 均线 量能 趋势",
+            "valuation": f"{ticker} 估值 PE PB Forward PE 增长",
+            "news": f"{ticker} 新闻 事件 发布时间 来源",
+        }
+        merged: list[Evidence] = []
+        seen: set[str] = set()
+        per_topic_k = max(3, int(self.config.top_k))
+        max_total = max(8, int(self.config.top_k) * 3)
+
+        for topic, q in topic_queries.items():
+            hits = self.rag.retrieve(q, top_k=per_topic_k, ticker=ticker, topic=topic)
+            for ev in hits:
+                key = str(ev.metadata.get("chunk_id", "") or f"{ev.source_id}:{ev.title}")
+                if key in seen:
+                    continue
+                merged.append(ev)
+                seen.add(key)
+                if len(merged) >= max_total:
+                    return merged
+
+        if not merged:
+            return self.rag.retrieve(f"{ticker} 基本面 技术面 估值 新闻 风险", top_k=self.config.top_k, ticker=ticker)
+        return merged
     def _inject_mcp_evidence(
         self,
         evidence: list[Evidence],
@@ -110,7 +148,7 @@ class FinanceResearchOrchestrator:
         fundamental: dict | None,
     ) -> list[Evidence]:
         enhanced = list(evidence)
-        if market and market.get("price") is not None:
+        if market and market.get("data_status") == "ok" and market.get("price") is not None:
             enhanced.insert(
                 0,
                 Evidence(
@@ -131,7 +169,7 @@ class FinanceResearchOrchestrator:
                 ),
             )
 
-        if fundamental:
+        if fundamental and _has_fundamental_signal(fundamental):
             enhanced.insert(
                 1 if enhanced else 0,
                 Evidence(
@@ -152,6 +190,20 @@ class FinanceResearchOrchestrator:
                     ),
                     score=4.8,
                     metadata={"from": "mcp", "tool": "fundamental_snapshot", "server": "finance_data"},
+                ),
+            )
+        elif fundamental:
+            enhanced.insert(
+                1 if enhanced else 0,
+                Evidence(
+                    source_id="mcp_fundamental_unavailable",
+                    title=f"{fundamental.get('ticker', '')} fundamental snapshot unavailable",
+                    content=(
+                        "基础财务快照当前不可用：未返回可审计的营收增速、利润增速、毛利率、ROE、自由现金流等核心字段。"
+                        "本轮基本面结论仅作观察，不给出方向性仓位建议。"
+                    ),
+                    score=1.0,
+                    metadata={"from": "mcp", "tool": "fundamental_snapshot", "server": "finance_data", "status": "unavailable"},
                 ),
             )
         return enhanced
@@ -178,11 +230,8 @@ class FinanceResearchOrchestrator:
         return sorted(outputs, key=lambda x: order.get(x.name, 99))
 
     def _run_with_langgraph(self, ticker: str, evidence: list[Evidence]) -> list[AgentOutput]:
-        from operator import add
-        from typing import TypedDict
 
         from langgraph.graph import END, START, StateGraph
-        from typing_extensions import Annotated
 
         class S(TypedDict):
             outputs: Annotated[list[AgentOutput], add]
@@ -243,6 +292,32 @@ def _fmt_pct(v: object) -> str:
     except Exception:  # noqa: BLE001
         return "N/A"
     return f"{num:.2f}%"
+
+
+
+def _has_fundamental_signal(data: dict) -> bool:
+    keys = [
+        "revenue_growth",
+        "earnings_growth",
+        "gross_margin",
+        "operating_margin",
+        "profit_margin",
+        "return_on_equity",
+        "free_cash_flow",
+        "total_cash",
+        "trailing_pe",
+        "forward_pe",
+        "price_to_book",
+    ]
+    ok = 0
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, (int, float)):
+            ok += 1
+    return ok >= 2
+
+
+
 
 
 

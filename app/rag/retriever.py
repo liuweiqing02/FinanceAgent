@@ -5,14 +5,14 @@ from collections import Counter
 
 from app.models.schemas import Evidence, RetrievalResult
 from app.rag.chunking import Chunk
-from app.rag.embeddings import HashEmbedding
+from app.rag.embeddings import TextEmbedding
 from app.rag.vectorstore.base import VectorStore
 
 
 class HybridRetriever:
     """BM25 + 向量混合检索。"""
 
-    def __init__(self, vector_store: VectorStore, embedding: HashEmbedding, bm25_weight: float, vector_weight: float) -> None:
+    def __init__(self, vector_store: VectorStore, embedding: TextEmbedding, bm25_weight: float, vector_weight: float) -> None:
         self.vector_store = vector_store
         self.embedding = embedding
         self.bm25_weight = bm25_weight
@@ -77,3 +77,4 @@ def _bm25(query: str, tf: Counter[str], df: Counter[str], n_docs: int, avg_len: 
         denom = f + k1 * (1 - b + b * dl / (avg_len or 1))
         score += idf * (f * (k1 + 1) / denom)
     return score
+
