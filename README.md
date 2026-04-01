@@ -1,24 +1,30 @@
-﻿# 金融智能投顾研报系统（Multi-Agent + RAG + 向量数据库）
+# 金融智能投顾研报系统
 
-本项目提供一个可运行、可测试、可展示的金融研报系统，输入股票代码即可生成**带证据引用**的 Markdown 研报。
+本项目是一个可运行、可测试、可扩展的投研自动化系统：输入股票代码后，自动完成真实数据采集、RAG 检索、多 Agent 分析与证据引用报告生成，输出可追溯的 Markdown 研报。
 
 ## 1. 功能特性
 
 - LangGraph 多 Agent（基本面、技术面、估值、新闻并行，最后总结）
 - MCP 工具协议与数据工具调用
-- 情感/风险推理能力
-- Markdown 研报输出
-- RAG 全链路：真实采集 -> 清洗 -> 聚合构建 -> 切块 -> 向量化 -> 检索 -> 重排 -> 生成 -> 引用
-- 真实数据源支持：SEC 财报/公告（10-K/10-Q/8-K）+ Google News RSS
-- 向量数据库：默认 Chroma（不可用时自动回退内存模式）
-- 向量库抽象接口 `VectorStore`（便于切换 Milvus/pgvector）
+- RAG 全链路：采集 -> 清洗 -> 构建 -> 检索 -> 重排 -> 生成 -> 引用
+- 真实数据源支持：SEC 财报/公告 + 新闻 RSS
+- 向量数据库：默认 Chroma（不可用自动回退内存模式）
 - Hybrid Retrieval（BM25 + 向量检索）
-- 可切换本地 Embedding（Hash / BGE / E5，失败自动回退 Hash）
-- 可切换本地 Reranker（Simple / Cross-Encoder，失败自动回退 Simple）
+- 可切换 Embedding（Hash / BGE / E5）与 Reranker（Simple / Cross-Encoder）
 - 强制证据引用与可追溯报告
-- 检索与生成可观测日志（query、召回、得分、结论）
+- 检索与生成日志可观测
 
-## 2. 目录结构
+## 2. 详细实现文档
+
+- [01 系统架构总览](docs/01-system-architecture.md)
+- [02 真实采集与知识库构建](docs/02-data-collection-kb.md)
+- [03 RAG 检索与重排实现](docs/03-rag-retrieval.md)
+- [04 多 Agent 编排与报告生成](docs/04-agent-workflow.md)
+- [05 新闻情感/风险模型（本地 LoRA）](docs/05-news-model.md)
+- [06 配置、运行与可观测性](docs/06-config-ops.md)
+- [07 测试策略与质量保障](docs/07-testing.md)
+
+## 3. 目录结构
 
 ```text
 app/
@@ -40,15 +46,15 @@ tests/
   e2e/
 ```
 
-## 3. 快速启动
+## 4. 快速启动
 
-### 3.1 安装
+### 4.1 安装
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3.2 配置
+### 4.2 配置
 
 ```bash
 cp .env.example .env
@@ -56,12 +62,11 @@ cp .env.example .env
 
 建议把 `SEC_USER_AGENT` 改成你自己的标识（SEC 接口要求）。
 
+### 4.3 大模型接口（百炼 / OpenAI 兼容）
 
-### 3.2.1 大模型接口（百炼 / OpenAI 兼容）
+本项目支持 OpenAI-Compatible 协议，只要兼容 `/chat/completions` 即可接入。
 
-本项目支持 **OpenAI-Compatible** 协议，Agent 可直接切换不同供应商。
-
-示例：阿里云百炼（DashScope 兼容）
+阿里云百炼示例：
 
 ```bash
 LLM_ENABLED=true
@@ -70,7 +75,7 @@ LLM_API_KEY=你的百炼API Key
 LLM_MODEL=qwen-plus
 ```
 
-示例：OpenAI
+OpenAI 示例：
 
 ```bash
 LLM_ENABLED=true
@@ -80,21 +85,21 @@ LLM_MODEL=gpt-4.1-mini
 ```
 
 说明：
-- 只要接口兼容 `/chat/completions`，即可接入。
 - 未开启 `LLM_ENABLED` 时，系统自动回退为规则模板模式（离线可跑）。
-### 3.3 构建真实知识库（批量）
+
+### 4.4 构建真实知识库（批量）
 
 ```bash
 python -m app.rag.ingest_build --mode real --tickers AAPL,TSLA
 ```
 
-如果你在离线环境，也可自动回退：
+离线环境可使用自动回退：
 
 ```bash
 python -m app.rag.ingest_build --mode auto --tickers AAPL,TSLA
 ```
 
-### 3.4 生成研报
+### 4.5 生成研报
 
 ```bash
 python -m app.main --ticker AAPL --kb-mode auto
@@ -102,66 +107,13 @@ python -m app.main --ticker AAPL --kb-mode auto
 
 输出文件默认在 `reports_output/`，例如：`reports_output/AAPL_report.md`。
 
-## 4. 真实采集流程说明
-
-1. `real_collectors.py` 拉取 SEC `company_tickers.json` 建立 ticker-cik 映射。  
-2. 拉取 `submissions/CIKxxxxx.json` 获取最新 10-K/10-Q/8-K。  
-3. 下载 filing 正文并抽取纯文本，写入 `data/raw/real_events.jsonl`。  
-4. 额外从 Google News RSS 拉取相关新闻摘要并统一落盘。  
-5. `knowledge_builder.py` 按 `ticker + topic` 聚合为 `data/knowledge_base/*.md` 多段文档。  
-6. RAG 管道对这些文档做切块、向量化、检索、重排和引用生成。  
-
 ## 5. 测试
 
 ```bash
 pytest
 ```
 
-测试覆盖：
-- 单元测试：切块、检索、情感/风险、知识库构建、真实采集器解析、内容质量
-- 集成测试：报告生成与富文本结构验收
-- e2e smoke：命令行全流程
+## 6. 备注
 
-
-## 6. 本地新闻情感/风险模型（方案A）
-
-### 6.1 为什么这样设计
-
-- 新闻情感/风险属于高频结构化判断，适合本地小模型承接，延迟更低、成本更稳。
-- 在 12G 显存下，推荐 `Qwen2.5-1.5B-Instruct + QLoRA(4bit)`。
-- 线上推理链路：`本地LoRA模型优先 -> 规则模型兜底`，保证可运行。
-
-### 6.2 安装模型依赖
-
-```bash
-pip install -r requirements-ml.txt
-```
-
-### 6.3 用你的数据集训练 LoRA
-
-```bash
-python -m app.models.train_news_lora \
-  --risk-csv "C:/pycode/offer/Finance/risk_deepseek_cleaned_nasdaq_news_full.csv" \
-  --sentiment-csv "C:/pycode/offer/Finance/sentiment_deepseek_new_cleaned_nasdaq_news_full.csv" \
-  --base-model "Qwen/Qwen2.5-1.5B-Instruct" \
-  --output-dir "models/news_qwen_lora" \
-  --max-samples 80000 \
-  --num-train-epochs 1 \
-  --batch-size 1 \
-  --grad-accum 16
-```
-
-### 6.4 启用本地新闻模型
-
-在 `.env` 中设置：
-
-```bash
-NEWS_MODEL_ENABLED=true
-NEWS_MODEL_BASE=Qwen/Qwen2.5-1.5B-Instruct
-NEWS_MODEL_ADAPTER=models/news_qwen_lora
-NEWS_MODEL_DEVICE=auto
-NEWS_MODEL_MAX_NEW_TOKENS=96
-```
-
-系统运行时会在 `logs/rag_trace.jsonl` 记录 `news_model_runtime` 是否生效。
-
+- 本地新闻 LoRA 训练与启用步骤见：[05 新闻情感/风险模型（本地 LoRA）](docs/05-news-model.md)
+- 如果你需要“部署版文档”（Docker、CI、生产参数建议），可在 `docs/` 继续补充。
