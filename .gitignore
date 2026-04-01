@@ -19,6 +19,7 @@ __run_main.log
 .venv-ml/
 
 # Generated data / artifacts
+data/
 data/tmp_local_model_smoke/
 data/tmp_local_model_smoke_escalated/
 models/news_qwen_lora/
